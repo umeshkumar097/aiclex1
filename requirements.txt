@@ -1,0 +1,10 @@
+cat > requirements.txt <<'REQ'
+streamlit
+pandas
+openpyxl
+pdfplumber
+pytesseract
+Pillow
+pdfminer.six
+python-magic
+REQ
