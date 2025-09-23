@@ -6,4 +6,3 @@ pytesseract
 Pillow
 pdfminer.six
 python-magic
-REQ
