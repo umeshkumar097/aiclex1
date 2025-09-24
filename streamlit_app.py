@@ -104,7 +104,7 @@ def extract_zip(zip_bytes):
             if name.endswith("/"): continue
             data=zf.read(name)
             if name.lower().endswith(".zip"):
-                out.extend(extract_zip(data))
+                out.extend(extract_zip_safe(data))
             elif name.lower().endswith(".pdf"):
                 info=parse_pdf(data,name)
                 info["pdf_name"]=os.path.basename(name)
