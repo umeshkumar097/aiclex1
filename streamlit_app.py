@@ -98,19 +98,47 @@ def extract_hall(text,fname):
 
 # ---------------- ZIP ----------------
 def extract_zip_safe(zip_bytes):
-    out=[]
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        for name in zf.namelist():
-            if name.endswith("/"): continue
-            data=zf.read(name)
-            if name.lower().endswith(".zip"):
-                out.extend(extract_zip_safe(data))
-            elif name.lower().endswith(".pdf"):
-                info=parse_pdf(data,name)
-                info["pdf_name"]=os.path.basename(name)
-                info["pdf_bytes"]=data
-                out.append(info)
-    return out
+    results = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for name in zf.namelist():
+                if name.endswith("/"):
+                    continue
+                try:
+                    data = zf.read(name)
+                except Exception as e:
+                    st.warning(f"Could not read {name}: {e}")
+                    continue
+
+                lname = name.lower()
+                if lname.endswith(".zip"):
+                    # Guarded nested zip open
+                    try:
+                        nested = extract_zip_safe(data)
+                        results.extend(nested)
+                    except zipfile.BadZipFile:
+                        # not a real zip, maybe PDF
+                        if is_pdf_bytes(data):
+                            try:
+                                results.append(parse_pdf(data, name))
+                            except Exception as e:
+                                st.warning(f"Failed to parse mislabeled PDF {name}: {e}")
+                        else:
+                            st.warning(f"Skipping non-zip, non-pdf file: {name}")
+                elif lname.endswith(".pdf") or is_pdf_bytes(data):
+                    try:
+                        results.append(parse_pdf(data, name))
+                    except Exception as e:
+                        st.warning(f"Failed to parse PDF {name}: {e}")
+                else:
+                    # ignore unknown files
+                    continue
+    except zipfile.BadZipFile:
+        # If even the top-level file is not a valid zip
+        st.error("Top-level file is not a valid zip archive.")
+        return []
+    return results
+
 
 def make_zip(files):
     bio=io.BytesIO()
