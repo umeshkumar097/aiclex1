@@ -1,8 +1,9 @@
-streamlit
-pandas
-openpyxl
-pdfplumber
-pytesseract
-Pillow
-pdfminer.six
-python-magic
+streamlit>=1.20.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+pdfplumber>=0.7.6
+pdfminer.six>=20221105
+pytesseract>=0.3.10
+Pillow>=9.4.0
+pdf2image>=1.16.3
+python-magic>=0.4.27
