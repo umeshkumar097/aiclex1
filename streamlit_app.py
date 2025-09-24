@@ -1,7 +1,15 @@
 # streamlit_app.py
 """
-Aiclex — Result Showing
-Improved OCR (pdf2image + pytesseract fallback), marks/status filling, location ZIP + Gmail sending.
+Aiclex — Result Showing (final)
+Features:
+- Upload Excel/CSV and nested ZIP of PDFs
+- OCR each PDF and extract Marks following the label "Marks Obtained"
+- If Marks numeric -> Pass if >49 else Fail. If label present but no numeric -> Absent.
+- Fill Excel marks/status columns (prefer existing Excel marks if present)
+- Produce Summary sheet (overall + per-location)
+- Group PDFs per recipient email, then group by location, create ZIPs, split ZIPs > 3MB
+- Preview ZIP parts and send via Gmail SMTP (smtp.gmail.com TLS) with test-mode option
+- Progress bar & logs in Streamlit UI
 """
 
 import os
@@ -10,11 +18,10 @@ import re
 import time
 import zipfile
 import tempfile
-import smtplib
-from email.message import EmailMessage
 from collections import defaultdict
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+from email.message import EmailMessage
 
 import streamlit as st
 import pandas as pd
@@ -22,116 +29,110 @@ import pdfplumber
 from PIL import Image
 import pytesseract
 
-# Optional pdf2image import will be used if available
 try:
     from pdf2image import convert_from_bytes
-    PDF2IMAGE_AVAILABLE = True
+    PDF2IMAGE = True
 except Exception:
-    PDF2IMAGE_AVAILABLE = False
+    PDF2IMAGE = False
 
-# ---------------- Config ----------------
-MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024  # 3 MB
+# ========== Configuration ==========
+DEFAULT_ATTACHMENT_MB = 3.0
+DEFAULT_DPI = 200
+# streamlit page
 st.set_page_config(page_title="Aiclex — Result Showing", layout="wide")
 st.title("📊 Aiclex — Result Showing")
 
-# ---------------- Sidebar: OCR & SMTP settings ----------------
-st.sidebar.header("OCR & SMTP Settings")
-tess_path = st.sidebar.text_input("Tesseract path (leave blank to use system tesseract)", value=os.environ.get("TESSERACT_CMD",""))
-ocr_lang = st.sidebar.text_input("OCR language (tesseract), e.g. 'eng' or 'eng+hin'", value="eng")
-ocr_dpi = st.sidebar.number_input("OCR DPI (pdf2image)", min_value=100, max_value=400, value=200)
+# ========== Sidebar: settings ==========
+st.sidebar.header("OCR / Sending Settings")
+tesseract_path = st.sidebar.text_input("Tesseract path (optional)", value=os.environ.get("TESSERACT_CMD", ""))
+ocr_lang = st.sidebar.text_input("OCR language for Tesseract (e.g. 'eng' or 'eng+hin')", value="eng")
+ocr_dpi = st.sidebar.number_input("OCR DPI (pdf2image)", min_value=100, max_value=400, value=DEFAULT_DPI)
 show_ocr_debug = st.sidebar.checkbox("Show OCR debug snippets", value=False)
-# SMTP defaults (user may override in UI fields too)
+
 st.sidebar.markdown("---")
-st.sidebar.markdown("**SMTP defaults for Gmail** (used in UI below)")
-st.sidebar.markdown("Host: smtp.gmail.com  Port: 587 (TLS)")
+st.sidebar.header("Email / Attachment Settings")
+attachment_limit_mb = st.sidebar.number_input("Attachment limit (MB)", value=DEFAULT_ATTACHMENT_MB, step=0.5)
+send_delay = st.sidebar.number_input("Delay between sends (seconds)", value=1.0, step=0.5)
+st.sidebar.markdown("SMTP: smtp.gmail.com (TLS port 587) recommended for Gmail (use App Password).")
 
-# apply tesseract path if set
-if tess_path:
-    pytesseract.pytesseract.tesseract_cmd = tess_path
+if tesseract_path:
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
 
-# ---------------- Regex ----------------
-HALL_RE = re.compile(r"\b[0-9]{4,}\b")
-ABSENT_RE = re.compile(r"\b(absent|not present|a\s*b\s*s\s*e\s*n\s*t)\b", re.IGNORECASE)
-MARKS_RE = re.compile(r"(?:marks|mark|score|total|obtained)[:\s\-]*([0-9]{1,3})", re.IGNORECASE)
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-
-# ---------------- Utility functions ----------------
+# ========== Utility helpers ==========
 def human_bytes(n):
     try:
         n = float(n)
     except:
         return ""
-    for unit in ["B","KB","MB","GB"]:
-        if n < 1024: return f"{n:.2f} {unit}"
+    for unit in ("B","KB","MB","GB"):
+        if n < 1024:
+            return f"{n:.2f} {unit}"
         n /= 1024
     return f"{n:.2f} TB"
 
-# ---------------- OCR / PDF extraction ----------------
+LABEL_RE = re.compile(r"Marks\s*Obtained\s*[:\-]?\s*(?:\n\s*)?([0-9]{1,3})", re.IGNORECASE)
+ABSENT_RE = re.compile(r"\b(absent|not present|a\s*b\s*s\s*e\s*n\s*t)\b", re.IGNORECASE)
+HALL_RE = re.compile(r"\b[0-9]{3,}\b")  # hallticket numeric candidates
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+# ========== OCR / PDF extraction ==========
 def extract_text_from_pdf_bytes(pdf_bytes, dpi=200, lang="eng"):
-    """
-    Robust PDF to text:
-    1) Try pdfplumber text extraction.
-    2) If empty, try pdf2image.convert_from_bytes -> pytesseract on images.
-    3) If pdf2image not available, try pdfplumber page.to_image() then OCR.
-    Returns combined text.
-    """
-    # 1) pdfplumber direct text
+    """Try pdfplumber text extraction first; if empty, use pdf2image -> pytesseract or page.to_image() fallback."""
+    # 1) pdfplumber text
     texts = []
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
+            for p in pdf.pages:
                 try:
-                    t = page.extract_text() or ""
+                    t = p.extract_text() or ""
                 except Exception:
                     t = ""
                 if t and t.strip():
                     texts.append(t)
     except Exception:
         pass
-
     combined = "\n".join(texts).strip()
     if combined:
         return combined
 
-    # 2) Use pdf2image -> pytesseract (preferred fallback)
-    if PDF2IMAGE_AVAILABLE:
+    # 2) pdf2image -> pytesseract
+    if PDF2IMAGE:
         try:
-            pil_pages = convert_from_bytes(pdf_bytes, dpi=dpi)
-            ocr_pages = []
-            for im in pil_pages:
+            images = convert_from_bytes(pdf_bytes, dpi=dpi)
+            ocr_texts = []
+            for im in images:
                 try:
                     txt = pytesseract.image_to_string(im, lang=lang)
                 except Exception:
                     txt = pytesseract.image_to_string(im)
-                ocr_pages.append(txt or "")
-            final = "\n".join(ocr_pages).strip()
+                ocr_texts.append(txt or "")
+            final = "\n".join(ocr_texts).strip()
             if final:
                 return final
         except Exception:
-            # fall through to next option
             pass
 
-    # 3) pdfplumber page.to_image() -> OCR
+    # 3) pdfplumber page.to_image() -> pytesseract
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            ocr_pages = []
-            for page in pdf.pages:
+            ocr_texts = []
+            for p in pdf.pages:
                 try:
-                    pil = page.to_image(resolution=dpi).original
+                    pil = p.to_image(resolution=dpi).original
                     try:
                         txt = pytesseract.image_to_string(pil, lang=lang)
                     except Exception:
                         txt = pytesseract.image_to_string(pil)
-                    ocr_pages.append(txt or "")
+                    ocr_texts.append(txt or "")
                 except Exception:
                     continue
-            final = "\n".join(ocr_pages).strip()
+            final = "\n".join(ocr_texts).strip()
             if final:
                 return final
     except Exception:
         pass
 
-    # 4) last resort: try opening bytes via PIL (rare)
+    # 4) PIL fallback
     try:
         im = Image.open(io.BytesIO(pdf_bytes))
         try:
@@ -142,98 +143,90 @@ def extract_text_from_pdf_bytes(pdf_bytes, dpi=200, lang="eng"):
     except Exception:
         return ""
 
-
-def find_hallticket_in_text(text):
-    if not text:
-        return None
-    candidates = HALL_RE.findall(text)
-    if not candidates:
-        return None
-    return max(candidates, key=len)
-
-def find_marks_or_absent_in_text(text):
-    """Return int mark, or 'Absent' string, or None."""
-    if not text:
-        return None
-    txt = text.replace("\xa0"," ")
-    lower = txt.lower()
-    # absent detection first
-    if ABSENT_RE.search(lower):
-        return "Absent"
-    # labeled marks
-    m = MARKS_RE.search(txt)
-    if m:
-        try:
-            v = int(m.group(1))
-            if 0 <= v <= 100:
-                return v
-        except:
-            pass
-    # fallback: any number 0-100, prefer lines mentioning mark/score/obtained
-    candidates = []
-    for line in txt.splitlines():
-        nums = re.findall(r"\b(\d{1,3})\b", line)
-        for n in nums:
-            v = int(n)
-            if 0 <= v <= 100:
-                weight = 2 if re.search(r'(?:marks|mark|score|total|obtained)', line, re.IGNORECASE) else 1
-                candidates.append((weight, v))
-    if candidates:
-        maxw = max(c[0] for c in candidates)
-        last = [c[1] for c in candidates if c[0] == maxw][-1]
-        return int(last)
-    return None
-
-# ---------------- ZIP processing (nested) ----------------
-def process_uploaded_zip_bytes(zip_bytes, ocr_dpi=200, ocr_lang="eng", show_debug=False):
-    """
-    Recursively process zip bytes, return list of dicts:
-    {'hallticket':..., 'marks':..., 'pdf_bytes':..., 'pdf_name':...}
-    """
-    results = []
+def extract_from_zip_recursive(zip_bytes, ocr_dpi, ocr_lang, show_debug=False):
+    """Return list of dicts: {pdf_name, pdf_bytes, hallticket (if found), marks (int|'Absent'|None), text_snippet}"""
+    out = []
     try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as outer:
-            for name in outer.namelist():
-                if name.endswith('/'): continue
-                data = outer.read(name)
-                if name.lower().endswith('.zip'):
-                    nested = process_uploaded_zip_bytes(data, ocr_dpi, ocr_lang, show_debug)
-                    results.extend(nested)
-                elif name.lower().endswith('.pdf'):
-                    # extract text with improved OCR
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for name in zf.namelist():
+                if name.endswith("/"):
+                    continue
+                data = zf.read(name)
+                lname = name.lower()
+                if lname.endswith(".zip"):
+                    out.extend(extract_from_zip_recursive(data, ocr_dpi, ocr_lang, show_debug))
+                elif lname.endswith(".pdf"):
                     text = extract_text_from_pdf_bytes(data, dpi=ocr_dpi, lang=ocr_lang)
-                    hall = find_hallticket_in_text(text)
-                    marks = find_marks_or_absent_in_text(text)
-                    results.append({
-                        "hallticket": str(hall).strip() if hall else "",
-                        "marks": marks,
-                        "pdf_bytes": data,
+                    # find "Marks Obtained" label number (first attempt)
+                    m = LABEL_RE.search(text or "")
+                    if m:
+                        try:
+                            val = int(m.group(1))
+                        except:
+                            val = None
+                    else:
+                        val = None
+                    # if label present but no numeric -> treat as Absent
+                    if m and val is None:
+                        marks = "Absent"
+                    else:
+                        # if no label found, check absent words
+                        if val is None and ABSENT_RE.search((text or "").lower()):
+                            marks = "Absent"
+                        elif val is None:
+                            # per your request: if Marks Obtained label not present / no number -> Absent
+                            marks = None
+                        else:
+                            marks = val
+                    # find possible hallticket in PDF text or fallback to filename digits
+                    hall = None
+                    h_cands = HALL_RE.findall(text or "")
+                    if h_cands:
+                        hall = max(h_cands, key=len)
+                    else:
+                        fn_digits = re.findall(r"\d+", os.path.basename(name))
+                        hall = fn_digits[-1] if fn_digits else ""
+                    out.append({
                         "pdf_name": os.path.basename(name),
-                        "text_snippet": text[:2000] if show_debug else ""
+                        "pdf_bytes": data,
+                        "hallticket": str(hall) if hall else "",
+                        "marks": marks,   # int | "Absent" | None
+                        "text_snippet": (text or "")[:2000] if show_debug else ""
                     })
                 else:
-                    # ignore other files
+                    # ignore other file types
                     continue
     except zipfile.BadZipFile:
         pass
-    return results
+    return out
 
-# ---------------- Excel fill logic ----------------
-def fill_excel_with_pdf_data(df, pdf_data, hall_col_name):
+# ========== Excel fill & summary ==========
+def fill_excel_with_pdf_data(df, pdf_entries, hall_col):
     """
-    Fill df['marks'] and df['status'] using pdf_data (list of dicts).
+    df: pandas DataFrame (string columns)
+    pdf_entries: list of dicts from extract_from_zip_recursive
+    hall_col: column name string in df that has hallticket
     Rules:
-      - prefer existing Excel marks (if present)
-      - else use PDF marks if present
-      - if mark found: if >49 => Pass else Fail (49 counts as Fail)
-      - if no mark anywhere or PDF says 'Absent' => Absent
+      - Prefer existing Excel marks (if non-empty)
+      - Else use PDF 'marks' if int
+      - If PDF 'marks' is "Absent" or Excel marks blank and PDF has no numeric -> Absent
+      - Pass if numeric >49, else Fail (49 => Fail)
+    Returns: updated_df, filled_count, unmatched_rows
     """
-    # build pdf map: hallticket -> marks (int or 'Absent')
+    # map pdf hallticket -> list of marks (choose first numeric if multiple)
     pdf_map = {}
-    for p in pdf_data:
-        k = str(p.get("hallticket") or "").strip()
-        if not k: continue
-        pdf_map[k] = p.get("marks")
+    for p in pdf_entries:
+        key = str(p.get("hallticket") or "").strip()
+        if not key:
+            continue
+        # prefer numeric marks; if multiple PDFs for same hallticket keep first with numeric else first Absent
+        current = pdf_map.get(key)
+        if current is None:
+            pdf_map[key] = p.get("marks")
+        else:
+            # if current None or 'Absent' and p has numeric, prefer numeric
+            if (current in (None, "Absent")) and isinstance(p.get("marks"), int):
+                pdf_map[key] = p.get("marks")
 
     # ensure columns
     marks_col = "marks"
@@ -245,23 +238,30 @@ def fill_excel_with_pdf_data(df, pdf_data, hall_col_name):
 
     filled = 0
     unmatched = []
+
     for idx, row in df.iterrows():
-        ht_val = str(row.get(hall_col_name, "")).strip()
+        ht_val = str(row.get(hall_col, "")).strip()
         if not ht_val:
             unmatched.append({"index": idx, "reason": "no_hallticket"})
             continue
 
-        # 1) prefer existing Excel marks (if non-empty)
+        # existing excel mark?
         excel_raw = row.get(marks_col, "")
         excel_mark = None
         if pd.notna(excel_raw) and str(excel_raw).strip() != "":
-            # try parse int, otherwise keep string
-            try:
-                excel_mark = int(re.sub(r"\D", "", str(excel_raw)))
-            except:
-                excel_mark = str(excel_raw).strip()
+            # try parse int; if 'Absent' string treat accordingly
+            txt = str(excel_raw).strip()
+            if re.search(r'abs', txt, re.IGNORECASE):
+                excel_mark = "Absent"
+            else:
+                digits = re.sub(r"\D", "", txt)
+                if digits:
+                    try:
+                        excel_mark = int(digits)
+                    except:
+                        excel_mark = None
 
-        # 2) pdf_mark
+        # pdf_map match attempts
         pdf_mark = None
         if ht_val in pdf_map:
             pdf_mark = pdf_map[ht_val]
@@ -270,44 +270,86 @@ def fill_excel_with_pdf_data(df, pdf_data, hall_col_name):
             if digits and digits in pdf_map:
                 pdf_mark = pdf_map[digits]
             else:
-                # try endswith/contains heuristic
+                # try endswith / contains
                 for k in pdf_map.keys():
-                    kd = re.sub(r"\D", "", str(k))
+                    kd = re.sub(r"\D","", str(k))
                     if kd and (k.endswith(digits) or digits.endswith(kd) or kd.endswith(digits)):
                         pdf_mark = pdf_map[k]
                         break
 
-        # 3) decide final_mark: excel preferred
-        final_mark = excel_mark if excel_mark is not None else pdf_mark
+        # decide final
+        final = None
+        if excel_mark is not None:
+            final = excel_mark
+        elif pdf_mark is not None:
+            final = pdf_mark
+        else:
+            final = None
 
-        # 4) set marks & status based on rules
-        if final_mark is None or (isinstance(final_mark, str) and re.search(r'abs', str(final_mark), re.IGNORECASE)):
+        # set marks & status
+        if final is None:
+            # treat as Absent per your instruction when no numeric found in 'Marks Obtained'
             df.at[idx, marks_col] = ""
             df.at[idx, status_col] = "Absent"
         else:
-            # numeric case
-            try:
-                mm = int(final_mark)
-                df.at[idx, marks_col] = mm
-                df.at[idx, status_col] = "Pass" if mm > 49 else "Fail"
-            except:
+            if isinstance(final, str) and re.search(r'abs', final, re.IGNORECASE):
                 df.at[idx, marks_col] = ""
                 df.at[idx, status_col] = "Absent"
-
+            else:
+                try:
+                    mm = int(final)
+                    df.at[idx, marks_col] = mm
+                    df.at[idx, status_col] = "Pass" if mm > 49 else "Fail"
+                except:
+                    df.at[idx, marks_col] = ""
+                    df.at[idx, status_col] = "Absent"
         filled += 1
 
     return df, filled, unmatched
 
-# ---------------- Zip creation & splitting ----------------
+def make_summary_sheet(df, location_col):
+    """
+    Create summary dataframe(s) and return a dict of DataFrames to write as separate sheets:
+    - 'results' : updated df
+    - 'summary_overall' : overall counts
+    - 'summary_by_location' : per-location pass/fail/absent counts
+    """
+    total = len(df)
+    pass_count = sum(df['status'] == 'Pass')
+    fail_count = sum(df['status'] == 'Fail')
+    absent_count = sum(df['status'] == 'Absent')
+
+    summary_overall = pd.DataFrame([{
+        "Total": total,
+        "Pass": int(pass_count),
+        "Fail": int(fail_count),
+        "Absent": int(absent_count)
+    }])
+
+    by_loc = []
+    if location_col in df.columns:
+        for loc, g in df.groupby(location_col):
+            by_loc.append({
+                "Location": loc,
+                "Total": len(g),
+                "Pass": int((g['status'] == 'Pass').sum()),
+                "Fail": int((g['status'] == 'Fail').sum()),
+                "Absent": int((g['status'] == 'Absent').sum())
+            })
+    summary_by_location = pd.DataFrame(by_loc)
+
+    return {"results": df, "summary_overall": summary_overall, "summary_by_location": summary_by_location}
+
+# ========== ZIP packaging & splitting ==========
 def make_zip_bytes(file_entries):
     bio = io.BytesIO()
-    with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for fname, content in file_entries:
-            zf.writestr(fname, content)
+    with zipfile.ZipFile(bio, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for fname, b in file_entries:
+            zf.writestr(fname, b)
     bio.seek(0)
     return bio.read()
 
-def split_files_into_zip_parts(file_entries, max_bytes=MAX_ATTACHMENT_BYTES, zip_name_prefix="results"):
+def split_files_into_zip_parts(file_entries, max_bytes, zip_name_prefix="results"):
     parts = []
     current = []
     for fname, b in file_entries:
@@ -318,18 +360,20 @@ def split_files_into_zip_parts(file_entries, max_bytes=MAX_ATTACHMENT_BYTES, zip
         else:
             if current:
                 parts.append((f"{zip_name_prefix}_part{len(parts)+1}.zip", make_zip_bytes(current)))
-            # if single file too big, put it alone (may exceed limit)
-            current = [(fname, b)]
-            test_zip2 = make_zip_bytes(current)
-            if len(test_zip2) > max_bytes:
-                parts.append((f"{zip_name_prefix}_part{len(parts)+1}.zip", test_zip2))
-                current = []
+            # put current file into its own part (may exceed max_bytes)
+            single = [(fname, b)]
+            parts.append((f"{zip_name_prefix}_part{len(parts)+1}.zip", make_zip_bytes(single)))
+            current = []
     if current:
         parts.append((f"{zip_name_prefix}_part{len(parts)+1}.zip", make_zip_bytes(current)))
     return parts
 
-# ---------------- Email sending (Gmail) ----------------
-def send_email_with_attachments_gmail(smtp_user, smtp_pass, to_email, subject, body, attachments):
+# ========== Email sending (Gmail TLS) ==========
+def send_email_gmail(smtp_user, smtp_pass, to_email, subject, body, attachments):
+    """
+    attachments: list of tuples (filename, bytes)
+    returns True/False, error_message(if any)
+    """
     msg = EmailMessage()
     msg["From"] = smtp_user
     msg["To"] = to_email
@@ -338,6 +382,7 @@ def send_email_with_attachments_gmail(smtp_user, smtp_pass, to_email, subject, b
     for fname, b in attachments:
         msg.add_attachment(b, maintype="application", subtype="zip", filename=fname)
     try:
+        import smtplib
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=60) as s:
             s.ehlo()
             s.starttls()
@@ -348,22 +393,12 @@ def send_email_with_attachments_gmail(smtp_user, smtp_pass, to_email, subject, b
     except Exception as e:
         return False, str(e)
 
-# ---------------- Streamlit UI ----------------
-st.write("Upload Excel/CSV and a ZIP (may contain nested ZIPs with PDFs).")
+# ========== Streamlit UI: main flow ==========
+st.header("1) Upload Excel/CSV and ZIP (nested ZIPs supported)")
+uploaded_excel = st.file_uploader("Upload Excel or CSV", type=["xlsx", "csv"])
+uploaded_zip = st.file_uploader("Upload ZIP (containing PDFs, nested zips ok)", type=["zip"])
 
-col1, col2 = st.columns(2)
-with col1:
-    uploaded_excel = st.file_uploader("Excel/CSV file", type=["xlsx", "xls", "csv"])
-with col2:
-    uploaded_zip = st.file_uploader("ZIP file (nested zips with PDFs)", type=["zip"])
-
-process_button = st.button("Process & Prepare Results")
-
-if process_button:
-    if not uploaded_excel or not uploaded_zip:
-        st.error("Please upload both Excel/CSV and ZIP file.")
-        st.stop()
-
+if uploaded_excel and uploaded_zip:
     # read excel
     try:
         if uploaded_excel.name.lower().endswith(".csv"):
@@ -374,149 +409,183 @@ if process_button:
         st.error(f"Failed to read Excel/CSV: {e}")
         st.stop()
 
-    st.success(f"Excel loaded — {len(df)} rows")
-
-    # pick columns
+    st.success(f"Excel loaded: {len(df)} rows")
     cols = df.columns.tolist()
-    hall_col = st.selectbox("Hallticket column", cols)
-    email_col = st.selectbox("Email column", cols)
-    loc_col = st.selectbox("Location column", cols)
+    hall_col = st.selectbox("Select Hallticket column", cols)
+    email_col = st.selectbox("Select Email column", cols)
+    location_col = st.selectbox("Select Location column", cols)
 
-    # process zip -> extract pdf data
-    with st.spinner("Processing ZIPs & running OCR (may take time)..."):
-        pdf_data = process_uploaded_zip_bytes(uploaded_zip.read(), ocr_dpi, ocr_lang, show_ocr_debug)
+    st.info("Processing ZIP and extracting PDFs (OCR may take time)...")
+    with st.spinner("Running OCR and extracting PDF fields..."):
+        pdf_entries = extract_from_zip_recursive(uploaded_zip.read(), ocr_dpi, ocr_lang, show_debug=show_ocr_debug)
 
-    st.info(f"PDF records extracted: {len(pdf_data)}")
+    st.success(f"Extracted {len(pdf_entries)} PDF records from ZIP(s)")
 
     if show_ocr_debug:
-        st.subheader("OCR Debug (first 200 chars of each PDF text)")
+        st.subheader("OCR debug (sample)")
         debug_rows = []
-        for p in pdf_data:
-            debug_rows.append({"pdf_name": p.get("pdf_name"), "hallticket": p.get("hallticket"), "marks": p.get("marks"), "text_snippet": (p.get("text_snippet") or "")[:200]})
-        st.dataframe(pd.DataFrame(debug_rows))
+        for p in pdf_entries:
+            debug_rows.append({
+                "pdf_name": p["pdf_name"],
+                "hallticket": p["hallticket"],
+                "marks": p["marks"],
+                "text_snippet": p["text_snippet"][:400]
+            })
+        st.dataframe(pd.DataFrame(debug_rows).head(200))
 
-    # fill excel using pdf_data
-    updated_df, filled_rows, unmatched = fill_excel_with_pdf_data(df, pdf_data, hall_col)
-    st.success(f"Filled {filled_rows} rows from PDFs")
+    # fill excel
+    updated_df, filled_count, unmatched = fill_excel_with_pdf_data(df.copy(), pdf_entries, hall_col)
+    st.success(f"Filled {filled_count} rows (marks/status).")
     if unmatched:
-        st.warning(f"{len(unmatched)} rows had missing hallticket (see preview)")
+        st.warning(f"{len(unmatched)} rows had no hallticket value.")
 
-    st.markdown("### Preview (first 50 rows)")
-    st.dataframe(updated_df.head(50))
+    st.subheader("Preview updated results (first 100 rows)")
+    st.dataframe(updated_df.head(100))
 
-    # download updated excel
-    out_buf = io.BytesIO()
-    try:
-        updated_df.to_excel(out_buf, index=False, engine="openpyxl")
-        out_buf.seek(0)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        st.download_button("Download updated Excel", data=out_buf, file_name=f"updated_aiclex_{ts}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    except Exception as e:
-        st.error(f"Failed to prepare download: {e}")
+    # produce summary workbook in memory and offer download
+    sheets = make_summary_sheet(updated_df, location_col)
+    excel_buf = io.BytesIO()
+    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+        for sheet_name, sheet_df in sheets.items():
+            sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    excel_buf.seek(0)
+    st.download_button("Download results + summary (Excel)", data=excel_buf,
+                       file_name=f"aiclex_results_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    # Group PDFs by location -> prepare zip parts per location
-    grouped = defaultdict(lambda: {"pdfs": [], "recipients": set()})
-    # Build quick map: hallticket -> list of pdf entries
+    # ========== Build grouping: recipients by email and collect their PDFs location-wise ==========
+    st.markdown("---")
+    st.header("2) Preview grouping & prepare ZIPs")
+    # Build mapping hallticket -> list of pdf entries
     pdf_map = defaultdict(list)
-    for p in pdf_data:
+    for p in pdf_entries:
         key = str(p.get("hallticket") or "").strip()
         if key:
             pdf_map[key].append(p)
 
+    # Map recipients to their halltickets and locations
+    recipients = defaultdict(lambda: {"locations": defaultdict(list)})
+    # track missing pdfs
+    missing_pdf_log = []
     for _, row in updated_df.iterrows():
         ht = str(row.get(hall_col, "")).strip()
-        loc = str(row.get(loc_col, "")).strip() or "Unknown"
         emails_raw = str(row.get(email_col, "")).strip()
-        if emails_raw:
-            for e in re.split(r"[;, \n]+", emails_raw):
-                if e and EMAIL_RE.match(e.strip()):
-                    grouped[loc]["recipients"].add(e.strip())
-        # attach pdfs for this hallticket
-        if ht and ht in pdf_map:
-            for p in pdf_map[ht]:
-                grouped[loc]["pdfs"].append(p)
-
-    # Show summary
-    st.markdown("### Location summary")
-    summary = []
-    for loc, info in grouped.items():
-        total_size = sum(len(p["pdf_bytes"]) for p in info["pdfs"])
-        summary.append({"Location": loc, "Recipients": len(info["recipients"]), "Files": len(info["pdfs"]), "Size": human_bytes(total_size)})
-    st.dataframe(pd.DataFrame(summary))
-
-    # Prepare ZIPs (split if needed) and email UI
-    if st.button("Prepare ZIPs for sending"):
-        prepared = {}
-        for loc, info in grouped.items():
-            if not info["pdfs"]:
-                prepared[loc] = []
+        loc = str(row.get(location_col, "")).strip() or "Unknown"
+        if not emails_raw:
+            continue
+        # split on common separators
+        emails = [e.strip() for e in re.split(r"[;, \n]+", emails_raw) if e.strip()]
+        for em in emails:
+            if not EMAIL_RE.match(em):
                 continue
-            files_for_zip = []
-            for p in info["pdfs"]:
-                fname = f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}"
-                files_for_zip.append((fname, p["pdf_bytes"]))
-            parts = split_files_into_zip_parts(files_for_zip, MAX_ATTACHMENT_BYTES, zip_name_prefix=re.sub(r"[^A-Za-z0-9]+","_",loc)[:40])
-            prepared[loc] = parts
-        st.session_state["prepared_zips"] = prepared
-        st.success("Prepared ZIP parts per location (in memory)")
+            # add pdfs for this hallticket
+            if ht and ht in pdf_map:
+                for p in pdf_map[ht]:
+                    recipients[em]["locations"][loc].append(p)
+            else:
+                # try matching by digits
+                digits = re.sub(r"\D","", ht)
+                found = False
+                if digits:
+                    for k, lst in pdf_map.items():
+                        kd = re.sub(r"\D","", str(k))
+                        if kd and (kd == digits or kd.endswith(digits) or digits.endswith(kd)):
+                            for p in lst: recipients[em]["locations"][loc].append(p)
+                            found = True
+                            break
+                if not found:
+                    missing_pdf_log.append({"email": em, "hallticket": ht, "location": loc})
 
-    if "prepared_zips" in st.session_state:
-        st.subheader("Prepared ZIP parts (sample)")
-        preview = []
-        for loc, parts in st.session_state["prepared_zips"].items():
-            for i, (fname, b) in enumerate(parts, start=1):
-                preview.append({"Location": loc, "Part": i, "ZipName": fname, "Size": human_bytes(len(b))})
-        st.dataframe(pd.DataFrame(preview))
+    st.subheader("Recipient summary (sample)")
+    rec_preview = []
+    for em, info in list(recipients.items())[:200]:
+        total_files = sum(len(v) for v in info["locations"].values())
+        rec_preview.append({"email": em, "locations": ", ".join(info["locations"].keys()), "files": total_files})
+    if rec_preview:
+        st.dataframe(pd.DataFrame(rec_preview))
+    else:
+        st.info("No recipients with matched PDFs found yet. Check email column / hallticket mapping.")
 
+    if missing_pdf_log:
+        st.warning(f"Some rows had no matching PDF found: {len(missing_pdf_log)} (sample shown)")
+        st.dataframe(pd.DataFrame(missing_pdf_log).head(50))
+
+    # ========== Prepare ZIP parts in memory ==========
+    if st.button("Prepare ZIPs (grouped by recipient -> location)"):
+        st.info("Preparing ZIP parts in memory (may use RAM).")
+        prepared = {}  # recipient -> list of (loc, [(partname, bytes), ...])
+        max_bytes = int(attachment_limit_mb * 1024 * 1024)
+        for em, info in recipients.items():
+            prepared[em] = []
+            for loc, plist in info["locations"].items():
+                # create file entries as (filename_inside_zip, bytes)
+                file_entries = []
+                for p in plist:
+                    fname = f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}"
+                    file_entries.append((fname, p["pdf_bytes"]))
+                parts = split_files_into_zip_parts(file_entries, max_bytes, zip_name_prefix=re.sub(r"[^A-Za-z0-9]+","_",loc)[:40])
+                prepared[em].append((loc, parts))
+        st.session_state["prepared"] = prepared
+        st.success("Prepared ZIP parts stored in session (in-memory).")
+
+    # Show prepared preview
+    if "prepared" in st.session_state:
+        preview_rows = []
+        for em, locs in st.session_state["prepared"].items():
+            for loc, parts in locs:
+                for i, (pname, pbytes) in enumerate(parts, start=1):
+                    preview_rows.append({"email": em, "location": loc, "part": i, "zip_name": pname, "size": human_bytes(len(pbytes))})
+        st.subheader("Prepared ZIPs preview")
+        st.dataframe(pd.DataFrame(preview_rows).head(200))
+
+        # ========== Sending UI ==========
         st.markdown("---")
-        st.subheader("Send Emails (Gmail)")
-
+        st.header("3) Send emails")
         smtp_user = st.text_input("Gmail address (SMTP user)", value=os.environ.get("SMTP_USER",""))
         smtp_pass = st.text_input("Gmail App Password (SMTP pass)", type="password", value=os.environ.get("SMTP_PASS",""))
-        test_mode = st.checkbox("Test mode (send all to test email)", value=True)
-        test_email = st.text_input("Test email (if test mode on)", value=os.environ.get("TEST_EMAIL","info@aiclex.in"))
-        delay_secs = st.number_input("Delay between sends (seconds)", value=1.0, step=0.5)
-
-        if st.button("Start sending emails"):
+        test_mode = st.checkbox("Test mode (send everything to single test email)", value=True)
+        test_email = st.text_input("Test email address (if test mode on)", value=os.environ.get("TEST_EMAIL",""))
+        body_template = st.text_area("Email body (use {location}, {part}, {total_parts})",
+                                    value="Hello,\n\nPlease find attached results for {location} (Part {part}/{total_parts}).\n\nRegards,\nAiclex")
+        subject_template = st.text_input("Email subject (use {location})", value="Results for {location}")
+        if st.button("Start sending prepared ZIPs"):
             if not smtp_user or not smtp_pass:
-                st.error("Provide Gmail address and app password (SMTP_USER & SMTP_PASS).")
+                st.error("Provide Gmail address and app password for SMTP.")
             else:
-                total_recipients = sum(len(grouped[loc]["recipients"]) for loc in grouped)
-                # if test_mode, send to single test address per part
-                progress = st.progress(0)
-                status = st.empty()
-                sent = 0
-                failed = []
-                total_parts = sum(len(parts) for parts in st.session_state["prepared_zips"].values())
-                if total_parts == 0:
-                    st.warning("No ZIP parts prepared to send.")
+                # compute total sends for progress
+                total_sends = 0
+                for em, locs in st.session_state["prepared"].items():
+                    recips = [test_email] if test_mode else [em]
+                    for loc, parts in locs:
+                        total_sends += len(recips) * max(1, len(parts))
+                if total_sends == 0:
+                    st.warning("No prepared zips to send.")
                 else:
-                    overall_index = 0
-                    for loc, parts in st.session_state["prepared_zips"].items():
-                        recips = list(grouped[loc]["recipients"])
-                        if test_mode:
-                            recips = [test_email]
-                        if not recips:
-                            # still may want to log or skip
-                            continue
-                        for part_index, (zipname, zipbytes) in enumerate(parts, start=1):
-                            subj = f"Results — {loc} (Part {part_index}/{len(parts)})"
-                            body = f"Dear Participant,\n\nPlease find attached the results for {loc} (Part {part_index}/{len(parts)}).\n\nRegards,\nAiclex"
-                            # send to each recipient (we send same attachments to all in that location)
-                            for r in recips:
-                                ok, err = send_email_with_attachments_gmail(smtp_user, smtp_pass, r, subj, body, [(zipname, zipbytes)])
-                                overall_index += 1
-                                progress.progress(min(1.0, overall_index / max(1, total_parts * max(1,len(recips)))))
-                                status.text(f"Sent to {r} — {loc} Part {part_index}/{len(parts)} ({overall_index})")
-                                if ok:
-                                    sent += 1
-                                else:
-                                    failed.append({"email": r, "loc": loc, "zip": zipname, "error": err})
-                                time.sleep(delay_secs)
-                st.success(f"Done. Sent: {sent}. Failed: {len(failed)}")
-                if failed:
-                    st.error("Some sends failed (sample):")
-                    st.dataframe(pd.DataFrame(failed).head(50))
+                    progress = st.progress(0)
+                    status = st.empty()
+                    sent = 0
+                    failed = []
+                    count = 0
+                    for em, locs in st.session_state["prepared"].items():
+                        recipients_list = [test_email] if test_mode else [em]
+                        for loc, parts in locs:
+                            total_parts = max(1, len(parts))
+                            for part_index, (zipname, zipbytes) in enumerate(parts, start=1):
+                                subj = subject_template.format(location=loc)
+                                body = body_template.format(location=loc, part=part_index, total_parts=total_parts)
+                                for r in recipients_list:
+                                    ok, err = send_email_gmail(smtp_user, smtp_pass, r, subj, body, [(zipname, zipbytes)])
+                                    count += 1
+                                    progress.progress(min(1.0, count / total_sends))
+                                    status.text(f"Sent {count}/{total_sends} → {r} ({loc} part {part_index}/{total_parts})")
+                                    if ok:
+                                        sent += 1
+                                    else:
+                                        failed.append({"recipient": r, "loc": loc, "zip": zipname, "error": err})
+                                    time.sleep(send_delay)
+                    st.success(f"Sending complete. Sent: {sent}. Failed: {len(failed)}")
+                    if failed:
+                        st.error("Some failures (sample):")
+                        st.dataframe(pd.DataFrame(failed).head(100))
 
 # End of file
