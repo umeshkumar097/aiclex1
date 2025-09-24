@@ -164,7 +164,7 @@ if excel and zipf:
     email_col=st.selectbox("Email col",df.columns)
     loc_col=st.selectbox("Location col",df.columns)
 
-    pdfs=extract_zip(zipf.read())
+    pdfs=extract_zip_safe(zipf.read())
     st.info(f"Extracted {len(pdfs)} PDFs")
 
     df=fill_excel(df,pdfs,hall_col)
