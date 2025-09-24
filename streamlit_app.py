@@ -316,22 +316,52 @@ def make_zip_bytes(file_entries):
     return bio.read()
 
 def split_files_into_zip_parts(file_entries, max_bytes, zip_name_prefix="results"):
+    """
+    Split a list of (filename, bytes) into multiple zip parts each <= max_bytes where possible.
+    Ensures part numbering is strictly incremental: <prefix>_part1.zip, <prefix>_part2.zip, ...
+    """
     parts = []
     current = []
+    part_no = 1
+
+    def flush_current():
+        nonlocal part_no, parts, current
+        if not current:
+            return
+        zip_name = f"{zip_name_prefix}_part{part_no}.zip"
+        parts.append((zip_name, make_zip_bytes(current)))
+        part_no += 1
+        current = []
+
     for fname, b in file_entries:
+        # try to add file to current batch
         test = current + [(fname, b)]
         test_zip = make_zip_bytes(test)
         if len(test_zip) <= max_bytes:
+            # safe to keep in current batch
             current = test
+            continue
+        # can't add to current: flush current as one part (if any)
+        if current:
+            flush_current()
+        # now try placing this file alone
+        single_zip = make_zip_bytes([(fname, b)])
+        if len(single_zip) <= max_bytes:
+            # start a new current batch with this file (it fits)
+            current = [(fname, b)]
         else:
-            if current:
-                parts.append((f"{zip_name_prefix}_part{len(parts)+1}.zip", make_zip_bytes(current)))
-            # put this file in its own part (may exceed max_bytes)
-            parts.append((f"{zip_name_prefix}_part{len(parts)+1}.zip", make_zip_bytes([(fname, b)])))
+            # file alone exceeds max_bytes: put it as its own part (may be > max_bytes)
+            zip_name = f"{zip_name_prefix}_part{part_no}.zip"
+            parts.append((zip_name, single_zip))
+            part_no += 1
             current = []
+
+    # flush any remaining files
     if current:
-        parts.append((f"{zip_name_prefix}_part{len(parts)+1}.zip", make_zip_bytes(current)))
+        flush_current()
+
     return parts
+
 
 def send_email_with_attachments_gmail(smtp_user, smtp_pass, to_emails, subject, body, attachments):
     msg = EmailMessage()
