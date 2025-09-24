@@ -97,7 +97,7 @@ def extract_hall(text,fname):
     return digits[-1] if digits else ""
 
 # ---------------- ZIP ----------------
-def extract_zip(zip_bytes):
+def extract_zip_safe(zip_bytes):
     out=[]
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for name in zf.namelist():
