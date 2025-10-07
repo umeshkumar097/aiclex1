@@ -9,6 +9,7 @@ import re
 import time
 import zipfile
 import logging
+import smtplib
 from collections import defaultdict
 from datetime import datetime
 from email.message import EmailMessage
@@ -367,29 +368,6 @@ def split_files_into_zip_parts(file_entries, max_bytes, zip_name_prefix="results
         flush_current()
     return parts
 
-# Email send
-def send_email_with_attachments_gmail(smtp_user, smtp_pass, to_emails, subject, body, attachments):
-    msg = EmailMessage()
-    msg["From"] = smtp_user
-    if isinstance(to_emails, list):
-        msg["To"] = ", ".join(to_emails)
-    else:
-        msg["To"] = to_emails
-    msg["Subject"] = subject
-    msg.set_content(body)
-    for fname, b in attachments:
-        msg.add_attachment(b, maintype="application", subtype="zip", filename=fname)
-    try:
-        import smtplib
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=60) as s:
-            s.ehlo(); s.starttls(); s.ehlo()
-            s.login(smtp_user, smtp_pass)
-            s.send_message(msg)
-        return True, None
-    except Exception as e:
-        logger.error("SMTP send failed: %s", e)
-        return False, str(e)
-
 # ---------------- Main UI Flow ----------------
 st.header("Step 1 — Upload Excel/CSV and ZIP")
 col1, col2 = st.columns(2)
@@ -401,10 +379,14 @@ with col2:
 if uploaded_excel and uploaded_zip:
     # read excel
     try:
-        if uploaded_excel.name.lower().endswith(".csv"):
-            df = pd.read_csv(uploaded_excel, dtype=str).fillna("")
-        else:
-            df = pd.read_excel(uploaded_excel, dtype=str, engine="openpyxl").fillna("")
+        if 'df' not in st.session_state or st.session_state.get('uploaded_excel_name') != uploaded_excel.name:
+            if uploaded_excel.name.lower().endswith(".csv"):
+                df = pd.read_csv(uploaded_excel, dtype=str).fillna("")
+            else:
+                df = pd.read_excel(uploaded_excel, dtype=str, engine="openpyxl").fillna("")
+            st.session_state['df'] = df
+            st.session_state['uploaded_excel_name'] = uploaded_excel.name
+        df = st.session_state['df']
     except Exception as e:
         st.error(f"Failed to read Excel/CSV: {e}")
         st.stop()
@@ -415,13 +397,20 @@ if uploaded_excel and uploaded_zip:
     email_col = st.selectbox("Select Email column", cols)
     location_col = st.selectbox("Select Location column", cols)
 
-    # process zip -> pdf_data
-    with st.spinner("Processing ZIP(s) and running OCR (may take time)..."):
-        try:
-            pdf_data = extract_from_zip_recursive(uploaded_zip.read(), ocr_dpi=ocr_dpi, ocr_lang_s=ocr_lang)
-        except zipfile.BadZipFile:
-            st.error("Uploaded file is not a valid ZIP archive.")
-            pdf_data = []
+    # MODIFICATION 1: Process ZIP only once and cache in session_state
+    if 'pdf_data' not in st.session_state or st.session_state.get('uploaded_zip_name') != uploaded_zip.name:
+        with st.spinner("Processing ZIP(s) and running OCR (This will run only once per file)..."):
+            try:
+                zip_bytes = uploaded_zip.read()
+                st.session_state['pdf_data'] = extract_from_zip_recursive(zip_bytes, ocr_dpi=ocr_dpi, ocr_lang_s=ocr_lang)
+                st.session_state['uploaded_zip_name'] = uploaded_zip.name
+            except zipfile.BadZipFile:
+                st.error("Uploaded file is not a valid ZIP archive.")
+                st.session_state['pdf_data'] = []
+            except Exception as e:
+                st.error(f"An error occurred during ZIP processing: {e}")
+                st.session_state['pdf_data'] = []
+    pdf_data = st.session_state['pdf_data']
     st.info(f"PDF records extracted: {len(pdf_data)}")
 
     if show_ocr_debug and pdf_data:
@@ -471,7 +460,7 @@ if uploaded_excel and uploaded_zip:
         if k:
             pdf_map_multi[k].append(p)
 
-    recipients = defaultdict(lambda: defaultdict(list))  # email -> location -> list of (fname, bytes)
+    recipients = defaultdict(lambda: defaultdict(list)) # email -> location -> list of (fname, bytes)
     missing_log = []
     # iterate rows safely
     for idx, row in updated_df.iterrows():
@@ -538,7 +527,7 @@ if "prepared" in st.session_state:
     st.header("Step 3 — ZIP Preview (by recipient & location)")
     preview_rows = []
     # Build a location-wise summary as user requested
-    location_summary = defaultdict(list)  # location -> list of part names
+    location_summary = defaultdict(list) # location -> list of part names
     for em, locs in st.session_state["prepared"].items():
         for loc, parts in locs:
             for pname, pbytes in parts:
@@ -570,45 +559,80 @@ if "prepared" in st.session_state:
             # count sends
             total_sends = 0
             for em, locs in st.session_state["prepared"].items():
-                recipient_list = [e.strip() for e in re.split(r"[;, \n]+", em) if e.strip()]
-                if test_mode:
-                    recipient_list = [test_email] if test_email else []
                 for loc, parts in locs:
-                    total_sends += len(recipient_list) * max(1, len(parts))
+                    total_sends += len(parts)
+
             if total_sends == 0:
                 st.warning("No prepared zips to send.")
             else:
                 progress = st.progress(0)
                 status = st.empty()
+                
+                # MODIFICATION 2 & 3: Add success log and use a single SMTP connection
+                success_log = []
+                failed_log = []
                 sent_count = 0
-                failed = []
-                cur = 0
-                items = list(st.session_state["prepared"].items())
-                total_items = len(items)
-                for ri, (em, locs) in enumerate(items, start=1):
-                    status.text(f"Processing recipient {ri}/{total_items}: {em}")
-                    recipient_list = [e.strip() for e in re.split(r"[;, \n]+", em) if e.strip()]
-                    if test_mode:
-                        recipient_list = [test_email] if test_email else []
-                    for loc, parts in locs:
-                        total_parts = max(1, len(parts))
-                        for part_idx, (zipname, zipbytes) in enumerate(parts, start=1):
-                            subj = subj_template.format(location=loc, part=part_idx, total_parts=total_parts)
-                            body = body_template.format(location=loc, part=part_idx, total_parts=total_parts)
-                            ok, err = send_email_with_attachments_gmail(smtp_user, smtp_pass, recipient_list, subj, body, [(zipname, zipbytes)])
-                            cur += 1
-                            progress.progress(min(1.0, cur / total_sends))
-                            status.text(f"Sent {cur}/{total_sends} → {recipient_list} ({loc} part {part_idx}/{total_parts})")
-                            if ok:
-                                sent_count += 1
-                            else:
-                                failed.append({"recipients": recipient_list, "loc": loc, "zip": zipname, "error": err})
-                            time.sleep(send_delay)
+                
+                try:
+                    with smtplib.SMTP("smtp.gmail.com", 587, timeout=60) as s:
+                        s.ehlo()
+                        s.starttls()
+                        s.ehlo()
+                        s.login(smtp_user, smtp_pass)
+                        
+                        items = list(st.session_state["prepared"].items())
+                        for ri, (em, locs) in enumerate(items, start=1):
+                            recipient_list_orig = [e.strip() for e in re.split(r"[;, \n]+", em) if e.strip()]
+                            
+                            for loc, parts in locs:
+                                total_parts = len(parts)
+                                for part_idx, (zipname, zipbytes) in enumerate(parts, start=1):
+                                    sent_count += 1
+                                    
+                                    recipient_list = [test_email] if test_mode and test_email else recipient_list_orig
+                                    if not recipient_list:
+                                        failed_log.append({"recipients": em, "loc": loc, "zip": zipname, "error": "Recipient email address is empty"})
+                                        continue
+
+                                    # Create message
+                                    msg = EmailMessage()
+                                    msg["From"] = smtp_user
+                                    msg["To"] = ", ".join(recipient_list)
+                                    msg["Subject"] = subj_template.format(location=loc, part=part_idx, total_parts=total_parts)
+                                    msg.set_content(body_template.format(location=loc, part=part_idx, total_parts=total_parts))
+                                    msg.add_attachment(zipbytes, maintype="application", subtype="zip", filename=zipname)
+                                    
+                                    status_text = f"Sending {sent_count}/{total_sends} to {recipient_list[0]}... ({loc} Part {part_idx}/{total_parts})"
+                                    status.text(status_text)
+                                    
+                                    try:
+                                        s.send_message(msg)
+                                        success_log.append({
+                                            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                            "recipients": ", ".join(recipient_list),
+                                            "subject": msg["Subject"],
+                                            "zip_name": zipname,
+                                            "status": "Success"
+                                        })
+                                        time.sleep(send_delay)
+                                    except Exception as e:
+                                        logger.error(f"Failed to send to {recipient_list}: {e}")
+                                        failed_log.append({"recipients": ", ".join(recipient_list), "loc": loc, "zip": zipname, "error": str(e)})
+                                    
+                                    progress.progress(min(1.0, sent_count / total_sends))
+                
+                except Exception as e:
+                    st.error(f"A critical error occurred with the SMTP connection: {e}")
+
                 status.empty()
-                st.success(f"Sending finished. Sent: {sent_count}. Failed: {len(failed)}")
-                if failed:
-                    st.error("Some sends failed (sample):")
-                    st.dataframe(pd.DataFrame(failed).head(50))
+                st.success(f"Sending finished. Successful: {len(success_log)}. Failed: {len(failed_log)}")
+                
+                if success_log:
+                    st.subheader("✅ Success Log")
+                    st.dataframe(pd.DataFrame(success_log))
+                if failed_log:
+                    st.subheader("❌ Failure Log")
+                    st.dataframe(pd.DataFrame(failed_log))
 
 st.write("---")
 st.markdown(f"<div style='color:gray; font-size:12px'>App by {BRAND} — Aiclex</div>", unsafe_allow_html=True)
