@@ -219,7 +219,8 @@ def extract_from_zip_recursive(zip_bytes: bytes, ocr_dpi: int, ocr_lang_s: str):
             prog_place = st.empty()
             prog = st.progress(0)
             for i, name in enumerate(names, start=1):
-                prog_place.text(f"Scanning archive entry {i}/{total}: {name}")
+                # MODIFICATION 1: Show only the filename, not the full path.
+                prog_place.text(f"Scanning archive entry {i}/{total}: {os.path.basename(name)}")
                 try:
                     data = zf.read(name)
                 except Exception as e:
@@ -397,7 +398,6 @@ if uploaded_excel and uploaded_zip:
     email_col = st.selectbox("Select Email column", cols)
     location_col = st.selectbox("Select Location column", cols)
 
-    # MODIFICATION 1: Process ZIP only once and cache in session_state
     if 'pdf_data' not in st.session_state or st.session_state.get('uploaded_zip_name') != uploaded_zip.name:
         with st.spinner("Processing ZIP(s) and running OCR (This will run only once per file)..."):
             try:
@@ -418,7 +418,6 @@ if uploaded_excel and uploaded_zip:
         debug_rows = [{"pdf_name": p["pdf_name"], "hallticket": p["hallticket"], "marks": p["marks"], "status": p["status"], "text_snippet": p.get("text_snippet","")[:500]} for p in pdf_data]
         st.dataframe(pd.DataFrame(debug_rows).head(200))
 
-    # fill excel with progress
     updated_df, filled_count, unmatched, pdf_map = fill_excel_using_pdf_data(df.copy(), pdf_data, hall_col)
     st.success(f"Filled {filled_count} rows (marks/status).")
     if unmatched:
@@ -427,7 +426,6 @@ if uploaded_excel and uploaded_zip:
     st.subheader("Preview updated results (first 100 rows)")
     st.dataframe(updated_df.head(100))
 
-    # download results + summary
     sheets = {}
     total = len(updated_df)
     pass_count = int((updated_df['status'] == 'Pass').sum())
@@ -436,7 +434,6 @@ if uploaded_excel and uploaded_zip:
     summary_overall = pd.DataFrame([{"Total": total, "Pass": pass_count, "Fail": fail_count, "Absent": absent_count}])
     sheets["results"] = updated_df
     sheets["summary_overall"] = summary_overall
-    # optional per-location summary
     if location_col in updated_df.columns:
         by_loc = []
         for loc, g in updated_df.groupby(location_col):
@@ -450,46 +447,50 @@ if uploaded_excel and uploaded_zip:
     out_buf.seek(0)
     st.download_button("Download results + summary (Excel)", data=out_buf, file_name=f"aiclex_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    # Group PDFs per recipient (email) and per location
     st.markdown("---")
     st.header("Step 2 — Prepare ZIPs grouped by recipient & location")
-    # build hallticket->list map
     pdf_map_multi = defaultdict(list)
     for p in pdf_data:
         k = str(p.get("hallticket","")).strip()
         if k:
             pdf_map_multi[k].append(p)
 
-    recipients = defaultdict(lambda: defaultdict(list)) # email -> location -> list of (fname, bytes)
+    recipients = defaultdict(lambda: defaultdict(list))
     missing_log = []
-    # iterate rows safely
     for idx, row in updated_df.iterrows():
         ht = str(row.get(hall_col,"")).strip()
         emails_raw = str(row.get(email_col,"")).strip()
         loc = str(row.get(location_col,"")).strip() or "Unknown"
+        
+        # MODIFICATION 2: Handle multiple emails in one cell correctly.
         if not emails_raw:
             continue
-        emails = [e.strip() for e in re.split(r"[;, \n]+", emails_raw) if e.strip()]
+        
+        # Clean, find unique emails, sort them, and join into a single string key.
+        # This ensures "a@x.com, b@y.com" and "b@y.com, a@x.com" are treated as the same recipient.
+        emails_list = [e.strip() for e in re.split(r"[;, \n]+", emails_raw) if e.strip()]
+        if not emails_list:
+            continue
+        recipient_key = ", ".join(sorted(list(set(emails_list))))
+
         found_any = False
-        for e in emails:
-            if ht and ht in pdf_map_multi:
-                for p in pdf_map_multi[ht]:
-                    recipients[e][loc].append((f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"]))
-                found_any = True
-            else:
-                digits = re.sub(r"\D","", ht)
-                matched = False
-                if digits:
-                    for k, lst in pdf_map_multi.items():
-                        kd = re.sub(r"\D","", str(k))
-                        if kd and (kd == digits or kd.endswith(digits) or digits.endswith(kd)):
-                            for p in lst:
-                                recipients[e][loc].append((f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"]))
-                            matched = True
-                            found_any = True
-                            break
+        if ht and ht in pdf_map_multi:
+            for p in pdf_map_multi[ht]:
+                recipients[recipient_key][loc].append((f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"]))
+            found_any = True
+        else:
+            digits = re.sub(r"\D","", ht)
+            if digits:
+                for k, lst in pdf_map_multi.items():
+                    kd = re.sub(r"\D","", str(k))
+                    if kd and (kd == digits or kd.endswith(digits) or digits.endswith(kd)):
+                        for p in lst:
+                             recipients[recipient_key][loc].append((f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"]))
+                        found_any = True
+                        break
+        
         if not found_any:
-            missing_log.append({"index": idx, "hallticket": ht, "emails": emails, "location": loc})
+            missing_log.append({"index": idx, "hallticket": ht, "emails": recipient_key, "location": loc})
 
     st.info(f"Recipients prepared: {len(recipients)} (sample below)")
     rec_preview = []
@@ -502,7 +503,6 @@ if uploaded_excel and uploaded_zip:
         st.warning(f"{len(missing_log)} rows had no matching PDFs (sample):")
         st.dataframe(pd.DataFrame(missing_log).head(50))
 
-    # Prepare ZIP parts in memory with progress
     if st.button("Prepare ZIPs (grouped by recipient->location)"):
         st.info("Preparing ZIP parts in memory (may use RAM).")
         max_bytes = int(attachment_limit_mb * 1024 * 1024)
@@ -526,8 +526,7 @@ if uploaded_excel and uploaded_zip:
 if "prepared" in st.session_state:
     st.header("Step 3 — ZIP Preview (by recipient & location)")
     preview_rows = []
-    # Build a location-wise summary as user requested
-    location_summary = defaultdict(list) # location -> list of part names
+    location_summary = defaultdict(list)
     for em, locs in st.session_state["prepared"].items():
         for loc, parts in locs:
             for pname, pbytes in parts:
@@ -535,7 +534,6 @@ if "prepared" in st.session_state:
                 location_summary[loc].append(pname)
     if preview_rows:
         st.dataframe(pd.DataFrame(preview_rows).head(500))
-    # Location parts summary
     loc_summary_rows = []
     for loc, partnames in location_summary.items():
         loc_summary_rows.append({"Location": loc, "PartsCount": len(partnames), "Parts": ", ".join(partnames)})
@@ -556,7 +554,6 @@ if "prepared" in st.session_state:
         if not smtp_user or not smtp_pass:
             st.error("Provide Gmail address and App Password (2FA app password).")
         else:
-            # count sends
             total_sends = 0
             for em, locs in st.session_state["prepared"].items():
                 for loc, parts in locs:
@@ -567,8 +564,6 @@ if "prepared" in st.session_state:
             else:
                 progress = st.progress(0)
                 status = st.empty()
-                
-                # MODIFICATION 2 & 3: Add success log and use a single SMTP connection
                 success_log = []
                 failed_log = []
                 sent_count = 0
@@ -581,43 +576,45 @@ if "prepared" in st.session_state:
                         s.login(smtp_user, smtp_pass)
                         
                         items = list(st.session_state["prepared"].items())
-                        for ri, (em, locs) in enumerate(items, start=1):
-                            recipient_list_orig = [e.strip() for e in re.split(r"[;, \n]+", em) if e.strip()]
+                        for ri, (email_key, locs) in enumerate(items, start=1):
+                            # The email_key is now the "email1, email2" string
+                            recipient_list_orig = [e.strip() for e in email_key.split(',') if e.strip()]
                             
                             for loc, parts in locs:
                                 total_parts = len(parts)
                                 for part_idx, (zipname, zipbytes) in enumerate(parts, start=1):
                                     sent_count += 1
                                     
-                                    recipient_list = [test_email] if test_mode and test_email else recipient_list_orig
-                                    if not recipient_list:
-                                        failed_log.append({"recipients": em, "loc": loc, "zip": zipname, "error": "Recipient email address is empty"})
+                                    # Use test email if test mode is on, otherwise use the original list
+                                    final_recipients = [test_email] if test_mode and test_email else recipient_list_orig
+                                    
+                                    if not final_recipients:
+                                        failed_log.append({"recipients": email_key, "loc": loc, "zip": zipname, "error": "Recipient email address is empty"})
                                         continue
 
-                                    # Create message
                                     msg = EmailMessage()
                                     msg["From"] = smtp_user
-                                    msg["To"] = ", ".join(recipient_list)
+                                    msg["To"] = ", ".join(final_recipients)
                                     msg["Subject"] = subj_template.format(location=loc, part=part_idx, total_parts=total_parts)
                                     msg.set_content(body_template.format(location=loc, part=part_idx, total_parts=total_parts))
                                     msg.add_attachment(zipbytes, maintype="application", subtype="zip", filename=zipname)
                                     
-                                    status_text = f"Sending {sent_count}/{total_sends} to {recipient_list[0]}... ({loc} Part {part_idx}/{total_parts})"
+                                    status_text = f"Sending {sent_count}/{total_sends} to {final_recipients[0]}... ({loc} Part {part_idx}/{total_parts})"
                                     status.text(status_text)
                                     
                                     try:
                                         s.send_message(msg)
                                         success_log.append({
                                             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                            "recipients": ", ".join(recipient_list),
+                                            "recipients": msg["To"],
                                             "subject": msg["Subject"],
                                             "zip_name": zipname,
                                             "status": "Success"
                                         })
                                         time.sleep(send_delay)
                                     except Exception as e:
-                                        logger.error(f"Failed to send to {recipient_list}: {e}")
-                                        failed_log.append({"recipients": ", ".join(recipient_list), "loc": loc, "zip": zipname, "error": str(e)})
+                                        logger.error(f"Failed to send to {final_recipients}: {e}")
+                                        failed_log.append({"recipients": msg["To"], "loc": loc, "zip": zipname, "error": str(e)})
                                     
                                     progress.progress(min(1.0, sent_count / total_sends))
                 
