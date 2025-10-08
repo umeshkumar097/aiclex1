@@ -1,289 +1,212 @@
+# --- Aiclex Media Processor (Streamlit UI) ---
+# Author: Aiclex Technologies (aiclex.in)
+# Version: 1.2.0
+# ---------------------------------------------
+
 import streamlit as st
 import pandas as pd
-import json
 import os
 import zipfile
-from PIL import Image, ImageDraw, ImageFont
-from io import BytesIO
 import shutil
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import inch
-from reportlab.lib.utils import ImageReader
+import tempfile
+from pathlib import Path
+from PIL import Image, ImageOps
 
-# --- Helper Functions ---
-def unzip_and_organize_files(zip_file_path: str, destination_dir: str):
-    os.makedirs(destination_dir, exist_ok=True)
-    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-        zip_ref.extractall(destination_dir)
-    return destination_dir
+# Third-party libraries (install from requirements.txt)
+try:
+    from pdf2image import convert_from_path
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
 
-def create_output_zip(source_dir: str, output_zip_path: str):
-    shutil.make_archive(os.path.splitext(output_zip_path)[0], 'zip', source_dir)
-    return output_zip_path
+# --- CONFIGURATION ---
 
-def clean_temp_dirs(directory: str):
-    if os.path.exists(directory) and os.path.isdir(directory):
-        try:
-            shutil.rmtree(directory)
-        except Exception as e:
-            print(f"Error cleaning directory: {e}")
+TARGET_SIZES_KB = {
+    "id_proof": (10, 24), "photo": (10, 24), "signature": (10, 24),
+    "qualification_proof": (50, 200), "unknown": (10, 500)
+}
+CATEGORY_KEYWORDS = {
+    "id_proof": ["id", "aadhaar", "pan", "passport", "dl", "driving"],
+    "photo": ["photo", "pic", "profile", "image"], "signature": ["sign", "signature"],
+    "qualification_proof": ["degree", "certificate", "marksheet", "qualification", "qual"]
+}
+SUPPORTED_MEDIA_EXT = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.pdf']
+MIN_QUALITY = 10
+DPI = 200
 
-def get_excel_df(excel_file_buffer) -> pd.DataFrame:
-    return pd.read_excel(excel_file_buffer)
+# --- CORE PROCESSING FUNCTIONS ---
 
-# --- PDF Generation Class ---
-class ImageFormFiller:
-    def __init__(self, template_image: Image.Image, mapping_data: dict, font_path: str, font_size: int = 24):
-        self.template_image = template_image.convert('RGB')
-        self.mapping_data = mapping_data
-        self.font_path = font_path
-        self.font_size = font_size
-        self.dpi = 300
-        self.page_width_pts = (self.template_image.width / self.dpi) * inch
-        self.page_height_pts = (self.template_image.height / self.dpi) * inch
-        try:
-            self.pil_font = ImageFont.truetype(self.font_path, self.font_size)
-        except IOError:
-            self.pil_font = ImageFont.load_default()
+def extract_all_zips(start_dir, status_placeholder):
+    """Recursively finds and extracts all nested ZIP files."""
+    while True:
+        zip_found_in_scan = False
+        for root, _, files in os.walk(start_dir):
+            for filename in files:
+                if filename.lower().endswith('.zip'):
+                    zip_path = Path(root) / filename
+                    extract_folder = zip_path.with_suffix('')
+                    status_placeholder.text(f"  -> Extracting nested ZIP: {filename}...")
+                    try:
+                        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                            zip_ref.extractall(extract_folder)
+                        zip_path.unlink()
+                        zip_found_in_scan = True
+                    except zipfile.BadZipFile:
+                        st.warning(f"Bad ZIP file, cannot extract: {filename}")
+                    break
+            if zip_found_in_scan:
+                break
+        if not zip_found_in_scan:
+            break
 
-    def _draw_text_on_image(self, draw: ImageDraw.Draw, text: str, x: int, y: int, w: int, h: int):
-        text_bbox = draw.textbbox((0, 0), text, font=self.pil_font)
-        text_width = text_bbox[2] - text_bbox[0]
-        text_height = text_bbox[3] - text_bbox[1]
-        draw_y = y
-        if text_width > w:
-            words = text.split(' ')
-            lines = []
-            current_line = ""
-            for word in words:
-                test_line = f"{current_line} {word}".strip()
-                test_bbox = draw.textbbox((0, 0), test_line, font=self.pil_font)
-                test_width = test_bbox[2] - test_bbox[0]
-                if test_width <= w:
-                    current_line = test_line
-                else:
-                    if current_line:
-                        lines.append(current_line)
-                    current_line = word
-            if current_line:
-                lines.append(current_line)
-            line_height = text_height + 14
-            start_y = y + (h - min(len(lines) * line_height, h)) // 2 - 2
-            for i, line in enumerate(lines):
-                line_bbox = draw.textbbox((0, 0), line, font=self.pil_font)
-                draw_x_line = x
-                draw_y_line = start_y + i * line_height
-                if draw_y_line + text_height <= y + h:
-                    draw.text((draw_x_line, draw_y_line), line, font=self.pil_font, fill=(0, 0, 0))
+def guess_category_by_filename(filename):
+    fn_lower = Path(filename).stem.lower()
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if any(keyword in fn_lower for keyword in keywords):
+            return category
+    return "unknown"
+
+def convert_any_to_jpg(input_path, output_jpg_path):
+    try:
+        ext = input_path.suffix.lower()
+        output_jpg_path.parent.mkdir(parents=True, exist_ok=True)
+        if ext == '.pdf':
+            if not PDF_SUPPORT: return False
+            pages = convert_from_path(input_path, dpi=DPI, first_page=1, last_page=1)
+            if pages: pages[0].save(output_jpg_path, 'JPEG')
+            return True
+        elif ext in SUPPORTED_MEDIA_EXT:
+            with Image.open(input_path) as img:
+                img = ImageOps.exif_transpose(img)
+                if img.mode != 'RGB': img = img.convert('RGB')
+                img.save(output_jpg_path, 'JPEG')
+            return True
+        return False
+    except Exception:
+        return False
+
+def compress_jpg_to_target(input_path, output_path, min_kb, max_kb):
+    try:
+        img = Image.open(input_path)
+        img_copy = img.copy()
+        for quality in range(95, MIN_QUALITY - 1, -5):
+            img_copy.save(output_path, 'JPEG', quality=quality, optimize=True)
+            if min_kb <= (output_path.stat().st_size / 1024) <= max_kb:
+                return "ok", output_path.stat().st_size / 1024
+        best_attempt_path = Path(str(output_path) + ".best")
+        shutil.copy(output_path, best_attempt_path)
+        for scale in [0.9, 0.75, 0.5]:
+            new_size = (int(img_copy.width * scale), int(img_copy.height * scale))
+            img_resized = img_copy.resize(new_size, Image.Resampling.LANCZOS)
+            for quality in range(90, MIN_QUALITY - 1, -10):
+                img_resized.save(output_path, 'JPEG', quality=quality, optimize=True)
+                size_kb = output_path.stat().st_size / 1024
+                if min_kb <= size_kb <= max_kb:
+                    best_attempt_path.unlink()
+                    return "ok", size_kb
+                if size_kb < best_attempt_path.stat().st_size / 1024:
+                     shutil.copy(output_path, best_attempt_path)
+        shutil.move(best_attempt_path, output_path)
+        return "partial", output_path.stat().st_size / 1024
+    except Exception:
+        return "compress_failed", 0
+
+def process_tree(source_dir, processed_dir, status_placeholder):
+    """Processes all files, updating the Streamlit UI."""
+    report_data = []
+    status_placeholder.text("Starting file processing...")
+    files_to_process = [p for p in source_dir.rglob('*') if p.is_file() and not p.name.lower().endswith('.zip')]
+    progress_bar = st.progress(0)
+
+    for i, input_path in enumerate(files_to_process):
+        relative_path = input_path.relative_to(source_dir)
+        status_placeholder.text(f"Processing: {relative_path}")
+        original_kb = input_path.stat().st_size / 1024
+        ext = input_path.suffix.lower()
+
+        if ext in SUPPORTED_MEDIA_EXT:
+            temp_jpg_path = Path(tempfile.gettempdir()) / f"temp_{relative_path.name}.jpg"
+            if not convert_any_to_jpg(input_path, temp_jpg_path):
+                report_data.append([relative_path, 'unknown', f"{original_kb:.2f}", 0, "convert_failed", "name"])
+                continue
+            category = guess_category_by_filename(input_path.name)
+            min_kb, max_kb = TARGET_SIZES_KB.get(category, TARGET_SIZES_KB["unknown"])
+            output_path = (processed_dir / relative_path).with_suffix(".jpg")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            status, final_kb = compress_jpg_to_target(temp_jpg_path, output_path, min_kb, max_kb)
+            report_data.append([relative_path, category, f"{original_kb:.2f}", f"{final_kb:.2f}", status, "name"])
+            if temp_jpg_path.exists(): temp_jpg_path.unlink()
         else:
-            draw_x = x
-            draw.text((draw_x, draw_y), text, font=self.pil_font, fill=(0, 0, 0))
+            output_path = processed_dir / relative_path
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(input_path, output_path)
+            report_data.append([relative_path, 'document', f"{original_kb:.2f}", f"{original_kb:.2f}", 'copied_as_is', 'name'])
+        
+        progress_bar.progress((i + 1) / len(files_to_process))
 
-    def fill_and_save_pdf(self, output_folder: str, candidate_data: dict, srno: str, name: str, photo_path: str = None):
-        filled_image = self.template_image.copy()
-        draw = ImageDraw.Draw(filled_image)
-        for field, coords in self.mapping_data["fields"].items():
-            x, y, w, h = coords["x"], coords["y"], coords["w"], coords["h"]
-            if field.lower() == "photo" and photo_path:
-                try:
-                    with Image.open(photo_path) as photo:
-                        photo = photo.resize((w, h), Image.Resampling.LANCZOS)
-                        filled_image.paste(photo, (x, y))
-                except Exception as e:
-                    print(f"Error with photo for {name}: {e}")
-            else:
-                # --- Field-specific formatting ---
-                if "ted" in field.lower():
-                    ted_value = candidate_data.get("ted", "")
-                    if pd.notna(ted_value) and ted_value != "":
-                        try:
-                            ted_dt = pd.to_datetime(ted_value)
-                            value = ted_dt.strftime("%d/%m/%Y")
-                        except:
-                            value = str(ted_value)
-                    else:
-                        value = ""
-                elif "tsd" in field.lower():
-                    tsd_value = candidate_data.get("tsd", "")
-                    if pd.notna(tsd_value) and tsd_value != "":
-                        try:
-                            tsd_dt = pd.to_datetime(tsd_value)
-                            value = tsd_dt.strftime("%d/%m/%Y")
-                        except:
-                            value = str(tsd_value)
-                    else:
-                        value = ""
-                elif "date of birth" in field.lower() or "dob" in field.lower():
-                    dob_value = candidate_data.get("date_of_birth", "")
-                    if pd.notna(dob_value) and dob_value != "":
-                        try:
-                            dob_dt = pd.to_datetime(dob_value)
-                            value = dob_dt.strftime("%d/%m/%Y")
-                        except:
-                            value = str(dob_value)
-                    else:
-                        value = ""
-                elif "address" in field.lower():
-                    parts = []
-                    for col in ["address_line1", "address_line2", "city", "district", "state"]:
-                        val = candidate_data.get(col.lower(), "")
-                        if pd.notna(val) and str(val).strip() != "":
-                            parts.append(str(val).strip())
-                    value = ", ".join(parts) if parts else ""
-                else:
-                    value = str(candidate_data.get(field.lower(), ""))
+    status_placeholder.text("Processing complete!")
+    return report_data
 
-                # --- Draw text with customized font size ---
-                if value:
-                    field_lower = field.lower()
-                    original_font = self.pil_font
+# --- STREAMLIT UI ---
 
-                    if field_lower in ["name"]:
-                        self.pil_font = ImageFont.truetype(self.font_path, 30)
-                    elif field_lower in ["ted", "tsd", "date of birth", "dob", "qualification"]:
-                        self.pil_font = ImageFont.truetype(self.font_path, 28)
-                    else:
-                        self.pil_font = ImageFont.truetype(self.font_path, self.font_size)
+st.set_page_config(page_title="Aiclex Media Processor", layout="wide")
+st.title("🗂️ Aiclex Media Processor")
+st.caption("Developed by Aiclex Technologies | aiclex.in")
 
-                    self._draw_text_on_image(draw, value, x, y, w, h)
-                    self.pil_font = original_font
+if not PDF_SUPPORT:
+    st.error("PDF processing is disabled. Please install 'poppler-utils' on the system to enable it.")
 
-        pdf_path = os.path.join(output_folder, f"{srno}_{name.replace(' ', '_')}.pdf")
-        with BytesIO() as img_buffer:
-            filled_image.save(img_buffer, format='PNG', dpi=(self.dpi, self.dpi))
-            img_buffer.seek(0)
-            c = canvas.Canvas(pdf_path, pagesize=(self.page_width_pts, self.page_height_pts))
-            c.drawImage(ImageReader(img_buffer), 0, 0, width=self.page_width_pts, height=self.page_height_pts)
-            c.save()
+uploaded_file = st.file_uploader(
+    "Apni .zip file yahaan upload karein",
+    type=["zip"],
+    help="Ek .zip file upload karein jismein aapke saare documents (images, PDFs, etc.) hon."
+)
 
-# --- Streamlit App UI ---
-st.set_page_config(page_title="Aiclex Bulk Form Filler", layout="wide")
-TEMP_DIR, OUTPUT_DIR = "temp", "output"
-FONT_PATH = "assets/DejaVuSans.ttf/DejaVuSans.ttf"
-os.makedirs(TEMP_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+if uploaded_file is not None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        source_files_dir = temp_path / "source"
+        processed_files_dir = temp_path / "processed"
+        source_files_dir.mkdir()
+        processed_files_dir.mkdir()
 
-st.sidebar.markdown('<h1 style="color:#1E3A8A;">Aiclex Technologies</h1>', unsafe_allow_html=True)
-st.sidebar.markdown('<h3>Bulk Form Filler</h3>', unsafe_allow_html=True)
-tab1, tab2, tab3 = st.tabs(["🚀 Overview", "✍️ Template Mapping (Manual)", "🔄 Process Forms"])
+        input_zip_path = temp_path / uploaded_file.name
+        with open(input_zip_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
 
-# --- Tab 1: Overview ---
-with tab1:
-    st.header("Welcome!")
-    st.write("Use the 'Template Mapping' tab to create your mapping file, then use 'Process Forms' to generate documents.")
+        st.info(f"Processing '{uploaded_file.name}'...")
+        status_box = st.empty()
 
-# --- Tab 2: Template Mapping ---
-with tab2:
-    st.header("✍️ Template Mapping (Manual Mode)")
-    st.info("Enter coordinates from an image editor like MS Paint.")
-    if 'mapping_data' not in st.session_state:
-        st.session_state.mapping_data = {"image_size": [0, 0], "fields": {}}
-    uploaded_template_file = st.file_uploader("**1. Upload Blank Form Image**", type=["png", "jpg", "jpeg"])
-    if uploaded_template_file:
-        template_image_pil = Image.open(uploaded_template_file)
-        w, h = template_image_pil.size
-        st.session_state.mapping_data["image_size"] = [w, h]
-        st.image(template_image_pil, caption="Your Template")
-        st.success(f"**Image Dimensions:** Width = {w}px, Height = {h}px")
-        st.warning("Use MS Paint or another image editor to find the pixel coordinates for each field.")
-    st.subheader("2. Add Fields Manually")
-    with st.form("mapping_form"):
-        cols = st.columns([2, 1, 1, 1, 1])
-        field_name = cols[0].text_input("Field Name (e.g., Name, Photo, Address, TED)")
-        x_coord = cols[1].number_input("X (from left)", min_value=0, step=10)
-        y_coord = cols[2].number_input("Y (from top)", min_value=0, step=10)
-        width = cols[3].number_input("Width", min_value=10, step=10, value=300)
-        height = cols[4].number_input("Height", min_value=10, step=10, value=50)
-        submitted = st.form_submit_button("Add Field")
-        if submitted and field_name:
-            st.session_state.mapping_data["fields"][field_name] = {"x": x_coord, "y": y_coord, "w": width, "h": height}
-            st.success(f"Added field '{field_name}'")
-    st.subheader("3. Review and Download Mapping JSON")
-    if st.session_state.mapping_data["fields"]:
-        st.json(st.session_state.mapping_data["fields"])
-        st.download_button(
-            label="Download Mapping JSON File",
-            data=json.dumps(st.session_state.mapping_data, indent=2),
-            file_name="mapping.json",
-            mime="application/json"
+        with st.spinner('Extracting ZIP file(s)...'):
+            with zipfile.ZipFile(input_zip_path, 'r') as zip_ref:
+                zip_ref.extractall(source_files_dir)
+            extract_all_zips(source_files_dir, status_box)
+
+        report_rows = process_tree(source_files_dir, processed_files_dir, status_box)
+        report_headers = ["path", "category", "original_kb", "final_kb", "status", "decided_via"]
+        df_report = pd.DataFrame(report_rows, columns=report_headers)
+        
+        base_name = uploaded_file.name.replace('.zip', '')
+        output_zip_path = temp_path / f"processed_{base_name}"
+        shutil.make_archive(str(output_zip_path), 'zip', processed_files_dir)
+
+        st.success("✅ Sabhi files process ho gayi hain!")
+        st.header("Processing Report")
+        st.dataframe(df_report)
+        
+        col1, col2 = st.columns(2)
+        with open(f"{output_zip_path}.zip", "rb") as fp:
+            col1.download_button(
+                label="📂 Processed ZIP Download Karein",
+                data=fp,
+                file_name=f"processed_{uploaded_file.name}",
+                mime="application/zip"
+            )
+
+        csv_data = df_report.to_csv(index=False).encode('utf-8')
+        col2.download_button(
+            label="📄 Report (CSV) Download Karein",
+            data=csv_data,
+            file_name=f"processing_report_{base_name}.csv",
+            mime='text/csv'
         )
-
-# --- Tab 3: Process Forms ---
-with tab3:
-    st.header("🔄 Process Forms")
-    uploaded_template_for_processing = st.file_uploader("1. Upload Blank Form Image", type=["png", "jpg"])
-    mapping_file = st.file_uploader("2. Upload Your Saved Mapping JSON", type=["json"])
-    excel_file = st.file_uploader("3. Upload Candidate Excel File", type=["xlsx"])
-    zip_file = st.file_uploader("4. Upload Candidate Photos ZIP", type=["zip"])
-
-    # --- START PROCESSING (Fixed Block) ---
-    if st.button("🚀 Start Processing"):
-        if all([uploaded_template_for_processing, mapping_file, excel_file, zip_file]):
-            with st.spinner("Processing..."):
-                template_image_process = Image.open(uploaded_template_for_processing)
-                mapping = json.load(mapping_file)
-                df = get_excel_df(excel_file)
-
-                zip_path = os.path.join(TEMP_DIR, zip_file.name)
-                with open(zip_path, "wb") as f:
-                    f.write(zip_file.getbuffer())
-
-                # Unzip candidate photos/documents
-                photo_dir = unzip_and_organize_files(zip_path, os.path.join(TEMP_DIR, "photos"))
-
-                output_run_dir = os.path.join(OUTPUT_DIR, "run")
-                if os.path.exists(output_run_dir):
-                    shutil.rmtree(output_run_dir)
-                os.makedirs(output_run_dir)
-
-                filler = ImageFormFiller(template_image_process, mapping, FONT_PATH)
-                progress_bar = st.progress(0)
-                total_rows = len(df)
-
-                for i, row in df.iterrows():
-                    # Detect SrNo / serial column
-                    sr_col = next((c for c in ['SrNo', 'Sl No.', 'SNo', 'Serial'] if c in df.columns), None)
-                    if not sr_col:
-                        st.error("Error: 'SrNo' or 'Sl No.' column not found in Excel.")
-                        break
-                    srno = str(row[sr_col]).split('.')[0]
-                    name = row.get('Name', f"Candidate_{srno}")
-
-                    # Find candidate folder inside unzipped photos
-                    candidate_folder_path = None
-                    for root, dirs, _ in os.walk(photo_dir):
-                        for d in dirs:
-                            if srno in d or (name.lower() in d.lower()):
-                                candidate_folder_path = os.path.join(root, d)
-                                break
-                        if candidate_folder_path:
-                            break
-
-                    candidate_folder = os.path.join(output_run_dir, f"{srno} {name}")
-                    os.makedirs(candidate_folder, exist_ok=True)
-
-                    # Copy all JPG documents (photo + other docs)
-                    if candidate_folder_path:
-                        for file_name in os.listdir(candidate_folder_path):
-                            file_path = os.path.join(candidate_folder_path, file_name)
-                            if os.path.isfile(file_path) and file_name.lower().endswith(".jpg"):
-                                shutil.copy(file_path, candidate_folder)
-
-                    candidate_data = row.to_dict()
-                    candidate_data_normalized = {k.lower().replace(" ", "_"): v for k, v in candidate_data.items()}
-
-                    # Fill PDF form with photo (if exists)
-                    photo_path = os.path.join(candidate_folder, "photo.jpg")
-                    if not os.path.exists(photo_path):
-                        photo_path = None
-                    filler.fill_and_save_pdf(candidate_folder, candidate_data_normalized, srno, name, photo_path)
-
-                    progress_bar.progress((i + 1) / total_rows)
-
-                final_zip = os.path.join(OUTPUT_DIR, "final_results.zip")
-                create_output_zip(output_run_dir, final_zip)
-                with open(final_zip, "rb") as fp:
-                    st.download_button("✅ Download Final ZIP", fp, "final_results.zip", "application/zip")
-                clean_temp_dirs(TEMP_DIR)
-        else:
-            st.error("Please upload all four files to start processing.")
