@@ -219,7 +219,6 @@ def extract_from_zip_recursive(zip_bytes: bytes, ocr_dpi: int, ocr_lang_s: str):
             prog_place = st.empty()
             prog = st.progress(0)
             for i, name in enumerate(names, start=1):
-                # MODIFICATION 1: Show only the filename, not the full path.
                 prog_place.text(f"Scanning archive entry {i}/{total}: {os.path.basename(name)}")
                 try:
                     data = zf.read(name)
@@ -334,39 +333,40 @@ def make_zip_bytes(file_entries):
     bio.seek(0)
     return bio.read()
 
+# MODIFICATION: Replaced the zip splitting function with a clearer, more robust version.
 def split_files_into_zip_parts(file_entries, max_bytes, zip_name_prefix="results"):
+    if not file_entries:
+        return []
+
     parts = []
-    current = []
+    current_files = []
     part_no = 1
-    def flush_current():
-        nonlocal part_no, parts, current
-        if not current:
-            return
-        zip_name = f"{zip_name_prefix}_part{part_no}.zip"
-        parts.append((zip_name, make_zip_bytes(current)))
-        part_no += 1
-        current = []
-    for fname, b in file_entries:
-        test = current + [(fname, b)]
-        test_zip = make_zip_bytes(test)
-        if len(test_zip) <= max_bytes:
-            current = test
-            continue
-        # can't add -> flush current if any
-        if current:
-            flush_current()
-        # try single file
-        single_zip = make_zip_bytes([(fname, b)])
-        if len(single_zip) <= max_bytes:
-            current = [(fname, b)]
-        else:
-            # file alone exceeds limit -> put as its own part (may be > max_bytes)
+    
+    for fname, content in file_entries:
+        # Check if adding the new file would make the current part too big
+        if current_files and len(make_zip_bytes(current_files + [(fname, content)])) > max_bytes:
+            # If it's too big, finalize (flush) the current part
             zip_name = f"{zip_name_prefix}_part{part_no}.zip"
-            parts.append((zip_name, single_zip))
+            parts.append((zip_name, make_zip_bytes(current_files)))
             part_no += 1
-            current = []
-    if current:
-        flush_current()
+            current_files = [] # Start a new empty part
+        
+        # Add the file to the current part.
+        current_files.append((fname, content))
+        
+        # It's possible for a single file to be larger than the max_bytes limit.
+        # If so, this part (containing just this one file) must be flushed immediately.
+        if len(make_zip_bytes(current_files)) > max_bytes:
+            zip_name = f"{zip_name_prefix}_part{part_no}.zip"
+            parts.append((zip_name, make_zip_bytes(current_files)))
+            part_no += 1
+            current_files = []
+            
+    # After the loop finishes, there might be files left in the last part. Flush them.
+    if current_files:
+        zip_name = f"{zip_name_prefix}_part{part_no}.zip"
+        parts.append((zip_name, make_zip_bytes(current_files)))
+        
     return parts
 
 # ---------------- Main UI Flow ----------------
@@ -462,12 +462,9 @@ if uploaded_excel and uploaded_zip:
         emails_raw = str(row.get(email_col,"")).strip()
         loc = str(row.get(location_col,"")).strip() or "Unknown"
         
-        # MODIFICATION 2: Handle multiple emails in one cell correctly.
         if not emails_raw:
             continue
         
-        # Clean, find unique emails, sort them, and join into a single string key.
-        # This ensures "a@x.com, b@y.com" and "b@y.com, a@x.com" are treated as the same recipient.
         emails_list = [e.strip() for e in re.split(r"[;, \n]+", emails_raw) if e.strip()]
         if not emails_list:
             continue
@@ -577,7 +574,6 @@ if "prepared" in st.session_state:
                         
                         items = list(st.session_state["prepared"].items())
                         for ri, (email_key, locs) in enumerate(items, start=1):
-                            # The email_key is now the "email1, email2" string
                             recipient_list_orig = [e.strip() for e in email_key.split(',') if e.strip()]
                             
                             for loc, parts in locs:
@@ -585,7 +581,6 @@ if "prepared" in st.session_state:
                                 for part_idx, (zipname, zipbytes) in enumerate(parts, start=1):
                                     sent_count += 1
                                     
-                                    # Use test email if test mode is on, otherwise use the original list
                                     final_recipients = [test_email] if test_mode and test_email else recipient_list_orig
                                     
                                     if not final_recipients:
