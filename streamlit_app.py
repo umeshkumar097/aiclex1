@@ -482,7 +482,7 @@ if uploaded_excel and uploaded_zip:
                     kd = re.sub(r"\D","", str(k))
                     if kd and (kd == digits or kd.endswith(digits) or digits.endswith(kd)):
                         for p in lst:
-                             recipients[recipient_key][loc].append((f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"]))
+                            recipients[recipient_key][loc].append((f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"]))
                         found_any = True
                         break
         
@@ -540,8 +540,23 @@ if "prepared" in st.session_state:
 
     st.markdown("---")
     st.header("Step 4 — Send Emails")
-    smtp_user = st.text_input("Gmail address (SMTP user)", value="info@cruxmanagement.com")
-    smtp_pass = st.text_input("Gmail App Password (SMTP pass)", type="password", value="norx wxop hvsm bvfu")
+    
+    # Load credentials from Streamlit secrets to keep them secure
+    smtp_user = None
+    smtp_pass = None
+    try:
+        smtp_user = st.secrets["email_credentials"]["smtp_user"]
+        smtp_pass = st.secrets["email_credentials"]["smtp_pass"]
+        st.success(f"Email credentials loaded successfully for: **{smtp_user}**")
+    except KeyError:
+        st.error("Email credentials not found. Please create a `.streamlit/secrets.toml` file.")
+        st.code("""
+# .streamlit/secrets.toml Example
+[email_credentials]
+smtp_user = "your-email@gmail.com"
+smtp_pass = "your-google-app-password"
+""")
+
     test_mode = st.checkbox("Test mode (send all to test email)", value=True)
     test_email = st.text_input("Test email (if test mode ON)")
     subj_template = st.text_input("Subject template", value="Results for {location} (Part {part}/{total_parts})")
@@ -549,7 +564,7 @@ if "prepared" in st.session_state:
 
     if st.button("Start sending prepared ZIPs"):
         if not smtp_user or not smtp_pass:
-            st.error("Provide Gmail address and App Password (2FA app password).")
+            st.error("Cannot send emails. Please configure your email credentials in the `.streamlit/secrets.toml` file first.")
         else:
             total_sends = 0
             for em, locs in st.session_state["prepared"].items():
