@@ -28,7 +28,7 @@ except Exception:
     PDF2IMAGE = False
 
 # ---------------- Config / Branding ----------------
-APP_TITLE = "Aiclex — Result Showing"
+APP_TITLE = "CRUX — Result Showing"
 BRAND = "Aiclex Technologies"
 DEFAULT_OCR_DPI = 200
 DEFAULT_OCR_LANG = "eng"
