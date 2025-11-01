@@ -81,6 +81,44 @@ def human_bytes(n):
         n /= 1024
     return f"{n:.2f} TB"
 
+class ProcessTracker:
+    """Single progress bar with ETA for multi-stage processing"""
+    def __init__(self, total_steps, description="Processing", show_ui=True):
+        self.total_steps = total_steps
+        self.current_step = 0
+        self.description = description
+        self.start_time = time.time()
+        self.show_ui = show_ui
+        # Create persistent streamlit elements only if show_ui is True
+        if show_ui:
+            self.progress_bar = st.progress(0)
+            self.status = st.empty()
+        else:
+            self.progress_bar = None
+            self.status = None
+        
+    def update(self, step_desc):
+        self.current_step += 1
+        # Calculate progress and ETA
+        progress = min(1.0, self.current_step / self.total_steps)  # Ensure progress doesn't exceed 1.0
+        elapsed = time.time() - self.start_time
+        if self.current_step > 1:  # Need at least 2 steps for ETA
+            eta = (elapsed / self.current_step) * (self.total_steps - self.current_step)
+            eta_text = f"ETA: {int(eta)}s"
+        else:
+            eta_text = "Calculating ETA..."
+        
+        # Update UI only if show_ui is True
+        if self.show_ui:
+            self.progress_bar.progress(progress)
+            self.status.write(f"{self.description}: {step_desc} ({min(self.current_step, self.total_steps)}/{self.total_steps}) - {eta_text}")
+    
+    def done(self, message="Processing complete!"):
+        if self.show_ui:
+            self.progress_bar.progress(1.0)
+            elapsed = time.time() - self.start_time
+            self.status.write(f"{message} (took {int(elapsed)}s)")
+
 def is_pdf_bytes(b: bytes) -> bool:
     try:
         return bool(b) and b.lstrip().startswith(b"%PDF")
@@ -210,21 +248,22 @@ def parse_pdf_bytes(pdf_bytes: bytes, fname: str = "", ocr_dpi: int = DEFAULT_OC
     }
 
 # Robust recursive ZIP extraction
-def extract_from_zip_recursive(zip_bytes: bytes, ocr_dpi: int, ocr_lang_s: str):
+def extract_from_zip_recursive(zip_bytes: bytes, ocr_dpi: int, ocr_lang_s: str, progress: ProcessTracker = None, nested_call: bool = False):
     results = []
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             names = zf.namelist()
             total = len(names)
-            prog_place = st.empty()
-            prog = st.progress(0)
+            # Only create new tracker for top-level call, with UI disabled for nested progress
+            if progress is None and not nested_call:
+                progress = ProcessTracker(total, "Processing ZIP files", show_ui=False)
             for i, name in enumerate(names, start=1):
-                prog_place.text(f"Scanning archive entry {i}/{total}: {os.path.basename(name)}")
+                if progress and not nested_call:
+                    progress.update(f"Processing: {os.path.basename(name)}")
                 try:
                     data = zf.read(name)
                 except Exception as e:
                     logger.warning("Cannot read entry %s: %s", name, e)
-                    prog.progress(i/total)
                     continue
                 lname = name.lower()
                 if lname.endswith(".zip"):
@@ -253,8 +292,8 @@ def extract_from_zip_recursive(zip_bytes: bytes, ocr_dpi: int, ocr_lang_s: str):
                     else:
                         # ignore other files
                         pass
-                prog.progress(i/total)
-            prog_place.empty()
+            if progress and not nested_call:
+                progress.done("ZIP processing complete!")
     except zipfile.BadZipFile:
         # top-level not a zip -> caller will handle
         raise
@@ -284,16 +323,15 @@ def fill_excel_using_pdf_data(df: pd.DataFrame, pdf_data: list, hall_col: str):
 
     filled = 0
     unmatched = []
-    # progress
-    place = st.empty()
-    prog = st.progress(0)
     total = len(df)
+    
+    # Single progress tracker for Excel filling (without UI)
+    progress = ProcessTracker(total, "Filling Excel data", show_ui=False)
     for i, (idx, row) in enumerate(df.iterrows(), start=1):
-        place.text(f"Filling row {i}/{total}")
+        progress.update(f"Processing row {i}")
         ht = str(row.get(hall_col,"")).strip()
         if not ht:
             unmatched.append({"index": idx, "reason": "no_hallticket"})
-            prog.progress(i/total)
             continue
         val = None
         if ht in pdf_map:
@@ -309,19 +347,21 @@ def fill_excel_using_pdf_data(df: pd.DataFrame, pdf_data: list, hall_col: str):
                         val = pdf_map[k]
                         break
         if val is None:
+            # No matching PDF found for this hallticket
             df.at[idx, marks_col] = ""
-            df.at[idx, status_col] = "Absent"
+            df.at[idx, status_col] = "No PDF"
         else:
             m = val.get("marks")
             if isinstance(m,int):
                 df.at[idx, marks_col] = int(m)
                 df.at[idx, status_col] = "Pass" if int(m) > 49 else "Fail"
             else:
+                # PDF exists but marks couldn't be parsed to an integer
                 df.at[idx, marks_col] = ""
-                df.at[idx, status_col] = "Absent"
+                df.at[idx, status_col] = "Absent "
         filled += 1
-        prog.progress(i/total)
-    place.empty()
+    progress.update(f"Processed {i} rows")
+    progress.done("Excel filling complete!")
     return df, filled, unmatched, pdf_map
 
 # ZIP helpers
@@ -398,33 +438,66 @@ if uploaded_excel and uploaded_zip:
     email_col = st.selectbox("Select Email column", cols)
     location_col = st.selectbox("Select Location column", cols)
 
-    if 'pdf_data' not in st.session_state or st.session_state.get('uploaded_zip_name') != uploaded_zip.name:
-        with st.spinner("Processing ZIP(s) and running OCR (This will run only once per file)..."):
-            try:
-                zip_bytes = uploaded_zip.read()
-                st.session_state['pdf_data'] = extract_from_zip_recursive(zip_bytes, ocr_dpi=ocr_dpi, ocr_lang_s=ocr_lang)
-                st.session_state['uploaded_zip_name'] = uploaded_zip.name
-            except zipfile.BadZipFile:
-                st.error("Uploaded file is not a valid ZIP archive.")
-                st.session_state['pdf_data'] = []
-            except Exception as e:
-                st.error(f"An error occurred during ZIP processing: {e}")
-                st.session_state['pdf_data'] = []
-    pdf_data = st.session_state['pdf_data']
-    st.info(f"PDF records extracted: {len(pdf_data)}")
+    # Use an explicit processing button so OCR/filling doesn't run immediately on upload.
+    process_key = f"{uploaded_excel.name}|{uploaded_zip.name}"
+    start_process = st.button("Start processing (Run OCR & Fill results)")
 
-    if show_ocr_debug and pdf_data:
-        st.subheader("OCR debug (sample snippets)")
-        debug_rows = [{"pdf_name": p["pdf_name"], "hallticket": p["hallticket"], "marks": p["marks"], "status": p["status"], "text_snippet": p.get("text_snippet","")[:500]} for p in pdf_data]
-        st.dataframe(pd.DataFrame(debug_rows).head(200))
+    already_processed = st.session_state.get("processed_key") == process_key
 
-    updated_df, filled_count, unmatched, pdf_map = fill_excel_using_pdf_data(df.copy(), pdf_data, hall_col)
-    st.success(f"Filled {filled_count} rows (marks/status).")
-    if unmatched:
-        st.warning(f"{len(unmatched)} rows had missing hallticket.")
+    if start_process and not already_processed:
+        try:
+            zip_bytes = uploaded_zip.read()
+            # Count total PDFs first
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                total_files = len([n for n in zf.namelist() if n.lower().endswith('.pdf') or n.lower().endswith('.zip')])
+            
+            # Main progress bar that will be visible in UI
+            main_progress = ProcessTracker(total_files, "Processing files", show_ui=True)
+            pdf_data = extract_from_zip_recursive(zip_bytes, ocr_dpi=ocr_dpi, ocr_lang_s=ocr_lang, progress=main_progress)
+            main_progress.done("Processing complete!")
+            
+            st.session_state['pdf_data'] = pdf_data
+            st.session_state['uploaded_zip_name'] = uploaded_zip.name
+            st.session_state['processed_key'] = process_key
+        except zipfile.BadZipFile:
+            st.error("Uploaded file is not a valid ZIP archive.")
+            st.session_state['pdf_data'] = []
+        except Exception as e:
+            st.error(f"An error occurred during ZIP processing: {e}")
+            st.session_state['pdf_data'] = []
 
-    st.subheader("Preview updated results (first 100 rows)")
-    st.dataframe(updated_df.head(100))
+    if st.session_state.get('processed_key') == process_key:
+        # use processed results from session state
+        pdf_data = st.session_state.get('pdf_data', [])
+        st.info(f"PDF records extracted: {len(pdf_data)}")
+
+        if show_ocr_debug and pdf_data:
+            st.subheader("OCR debug (sample snippets)")
+            debug_rows = [{"pdf_name": p["pdf_name"], "hallticket": p["hallticket"], "marks": p["marks"], "status": p["status"], "text_snippet": p.get("text_snippet","")[:500]} for p in pdf_data]
+            st.dataframe(pd.DataFrame(debug_rows).head(200))
+
+        updated_df, filled_count, unmatched, pdf_map = fill_excel_using_pdf_data(df.copy(), pdf_data, hall_col)
+        st.session_state['updated_df'] = updated_df
+        st.session_state['pdf_map'] = pdf_map
+        st.success(f"Filled {filled_count} rows (marks/status).")
+        if unmatched:
+            st.warning(f"{len(unmatched)} rows had missing hallticket.")
+
+        st.subheader("Preview updated results (first 100 rows)")
+        st.dataframe(updated_df.head(100))
+    else:
+        st.info("Files uploaded. Click 'Start processing (Run OCR & Fill results)' to begin OCR and fill the Excel.")
+
+    # Ensure variables exist even if user hasn't processed yet to avoid NameError.
+    updated_df = st.session_state.get('updated_df', df).copy()
+    pdf_data = st.session_state.get('pdf_data', [])
+
+    # Ensure expected columns exist to avoid KeyError later when summarizing
+    if 'marks' not in updated_df.columns:
+        updated_df['marks'] = ""
+    if 'status' not in updated_df.columns:
+        # default to 'Absent' for rows with no marks or leave empty string
+        updated_df['status'] = ""
 
     sheets = {}
     total = len(updated_df)
@@ -507,15 +580,16 @@ if uploaded_excel and uploaded_zip:
         total_recipients = len(recipients)
         prog_place = st.empty()
         prog = st.progress(0)
+        # Single progress tracker for ZIP preparation
+        progress = ProcessTracker(total_recipients, "Preparing ZIP files")
         for i, (em, locs) in enumerate(recipients.items(), start=1):
-            prog_place.text(f"Preparing for recipient {i}/{total_recipients}: {em}")
+            progress.update(f"Preparing files for: {em}")
             prepared[em] = []
             for loc, files in locs.items():
                 safe_prefix = re.sub(r"[^A-Za-z0-9]+","_", loc)[:40] or "loc"
                 parts = split_files_into_zip_parts(files, max_bytes, zip_name_prefix=safe_prefix)
                 prepared[em].append((loc, parts))
-            prog.progress(i/total_recipients)
-        prog_place.empty()
+        progress.done("ZIP preparation complete!")
         st.session_state["prepared"] = prepared
         st.success("Prepared ZIP parts stored in session memory.")
 
