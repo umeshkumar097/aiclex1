@@ -353,7 +353,7 @@ def fill_excel_using_pdf_data(df: pd.DataFrame, pdf_data: list, hall_col: str):
         else:
             m = val.get("marks")
             if isinstance(m,int):
-                df.at[idx, marks_col] = int(m)
+                df.at[idx, marks_col] = str(int(m))
                 df.at[idx, status_col] = "Pass" if int(m) > 49 else "Fail"
             else:
                 # PDF exists but marks couldn't be parsed to an integer
