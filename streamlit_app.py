@@ -797,10 +797,14 @@ if uploaded_excel and uploaded_zip:
         if k:
             pdf_map_multi[k].append(p)
 
-    recipients  = defaultdict(lambda: defaultdict(list))
+    # ----------------------------------------------------------------
+    # Group PDFs by (email_key, location) directly
+    # Same email + same location → combined into ONE ZIP → ONE email
+    # ----------------------------------------------------------------
+    grouped_by_email_loc  = defaultdict(list)   # (email_key, loc) → [(fname, bytes), ...]
+    email_loc_halltickets = defaultdict(list)   # (email_key, loc) → [hallticket, ...]
     missing_log = []
-    # send_key = (hallticket, email_key) — unique per row so PDFs never cross to wrong person
-    row_meta    = {}
+    row_meta    = {}   # kept for backward compat (email_key → meta)
 
     for idx, row in updated_df.iterrows():
         ht         = str(row.get(hall_col,"")).strip()
@@ -815,16 +819,17 @@ if uploaded_excel and uploaded_zip:
             continue
         recipient_key = ", ".join(sorted(list(set(emails_list))))
 
-        # Unique key = (hallticket + email group) — prevents cross-sending
-        send_key = (ht, recipient_key)
+        # row_meta keyed by email_key (for display in send log)
+        if recipient_key not in row_meta:
+            row_meta[recipient_key] = {"name": name_val, "email_key": recipient_key}
 
-        if send_key not in row_meta:
-            row_meta[send_key] = {"name": name_val, "hallticket": ht, "email_key": recipient_key}
+        group_key = (recipient_key, loc)   # ← NEW: group by email+location
+        email_loc_halltickets[group_key].append(ht)
 
         found_any = False
         if ht and ht in pdf_map_multi:
             for p in pdf_map_multi[ht]:
-                recipients[send_key][loc].append(
+                grouped_by_email_loc[group_key].append(
                     (f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"])
                 )
             found_any = True
@@ -836,7 +841,7 @@ if uploaded_excel and uploaded_zip:
                     kd = re.sub(r"\D", "", str(k))
                     if kd and kd == digits:
                         for p in lst:
-                            recipients[send_key][loc].append(
+                            grouped_by_email_loc[group_key].append(
                                 (f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"])
                             )
                         found_any = True
@@ -844,20 +849,22 @@ if uploaded_excel and uploaded_zip:
         if not found_any:
             missing_log.append({"index": idx, "hallticket": ht, "emails": recipient_key, "location": loc})
 
+    total_email_groups = len(grouped_by_email_loc)
     st.markdown(
         f"<div style='background:#f0f6ff; border:1px solid #b3d0f0; border-radius:6px; "
         f"padding:0.45rem 0.9rem; font-size:0.85rem; color:#1a3a6b; margin-bottom:0.4rem;'>"
-        f"Recipients prepared: <b>{len(recipients)}</b> — each hallticket isolated to its own email group</div>",
+        f"Email groups prepared: <b>{total_email_groups}</b> — "
+        f"same email + same location = <b>one combined ZIP email</b></div>",
         unsafe_allow_html=True
     )
     rec_preview = []
-    for (ht_key, em_key), locs in list(recipients.items())[:200]:
-        files_count = sum(len(lst) for lst in locs.values())
+    for (em_key, loc), files in list(grouped_by_email_loc.items())[:200]:
+        halls = email_loc_halltickets[(em_key, loc)]
         rec_preview.append({
-            "hallticket": ht_key,
-            "email": em_key,
-            "locations": ", ".join(locs.keys()),
-            "files": files_count
+            "email":        em_key,
+            "location":     loc,
+            "halltickets":  ", ".join(halls),
+            "total_files":  len(files)
         })
     if rec_preview:
         st.dataframe(pd.DataFrame(rec_preview))
@@ -865,25 +872,23 @@ if uploaded_excel and uploaded_zip:
         st.warning(f"{len(missing_log)} rows had no matching PDFs (sample):")
         st.dataframe(pd.DataFrame(missing_log).head(50))
 
-    if st.button("Prepare ZIPs (grouped by recipient->location)"):
+    if st.button("Prepare ZIPs (grouped by email→location)"):
         st.info("Preparing ZIP parts in memory (may use RAM).")
-        max_bytes        = int(attachment_limit_mb * 1024 * 1024)
-        prepared         = {}
-        total_recipients = len(recipients)
-        progress         = ProcessTracker(total_recipients, "Preparing ZIP files")
-        for i, (send_key, locs) in enumerate(recipients.items(), start=1):
-            ht_key, em_key = send_key
-            progress.update(f"Preparing: {ht_key} → {em_key[:40]}")
-            prepared[send_key] = []
-            for loc, files in locs.items():
-                safe_loc    = re.sub(r"[^A-Za-z0-9]+", "_", loc)[:30] or "loc"
-                safe_ht     = re.sub(r"[^A-Za-z0-9]+", "_", ht_key)[:20] or "ht"
-                safe_prefix = f"{safe_loc}_{safe_ht}"   # e.g. Pune_803038629
-                parts       = split_files_into_zip_parts(files, max_bytes, zip_name_prefix=safe_prefix)
-                prepared[send_key].append((loc, parts))
+        max_bytes    = int(attachment_limit_mb * 1024 * 1024)
+        prepared     = {}   # (email_key, loc) → [(zip_name, zip_bytes), ...]
+        total_groups = len(grouped_by_email_loc)
+        progress     = ProcessTracker(total_groups, "Preparing ZIP files")
+        for i, ((em_key, loc), files) in enumerate(grouped_by_email_loc.items(), start=1):
+            safe_loc    = re.sub(r"[^A-Za-z0-9]+", "_", loc)[:30] or "loc"
+            safe_em     = re.sub(r"[^A-Za-z0-9]+", "_", em_key.split("@")[0])[:20] or "email"
+            safe_prefix = f"{safe_loc}_{safe_em}"
+            progress.update(f"Preparing: {loc} → {em_key[:40]}")
+            parts = split_files_into_zip_parts(files, max_bytes, zip_name_prefix=safe_prefix)
+            prepared[(em_key, loc)] = parts
         progress.done("ZIP preparation complete!")
-        st.session_state["prepared"] = prepared
-        st.session_state["row_meta"] = row_meta
+        st.session_state["prepared"]              = prepared
+        st.session_state["row_meta"]              = row_meta
+        st.session_state["email_loc_halltickets"] = dict(email_loc_halltickets)
         st.success("Prepared ZIP parts stored in session memory.")
 
 
@@ -899,18 +904,16 @@ if "prepared" in st.session_state:
     st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
     preview_rows     = []
     location_summary = defaultdict(list)
-    for (ht_key, em_key), locs in st.session_state["prepared"].items():
-        for loc, parts in locs:
-            for pname, pbytes in parts:
-                sz = len(pbytes) if pbytes else 0
-                preview_rows.append({
-                    "hallticket": ht_key,
-                    "email": em_key,
-                    "location": loc,
-                    "zip_name": pname,
-                    "size": human_bytes(sz)
-                })
-                location_summary[loc].append(pname)
+    for (em_key, loc), parts in st.session_state["prepared"].items():
+        for pname, pbytes in parts:
+            sz = len(pbytes) if pbytes else 0
+            preview_rows.append({
+                "email":    em_key,
+                "location": loc,
+                "zip_name": pname,
+                "size":     human_bytes(sz)
+            })
+            location_summary[loc].append(pname)
     if preview_rows:
         st.dataframe(pd.DataFrame(preview_rows).head(500))
     loc_summary_rows = []
@@ -952,19 +955,16 @@ smtp_pass = "your-google-app-password"
                                    value="Results for {location} (Part {part}/{total_parts})")
     body_template = st.text_area("Body template",
                                   value="Hello,\n\nPlease find attached results for {location} (Part {part}/{total_parts}).\n\nRegards,\nAiclex")
-
     if st.button("Start sending prepared ZIPs"):
         if not smtp_user or not smtp_pass:
             st.error("Cannot send emails. Please configure your email credentials in the `.streamlit/secrets.toml` file first.")
         else:
-            prepared = st.session_state["prepared"]
-            row_meta = st.session_state.get("row_meta", {})
+            prepared   = st.session_state["prepared"]
+            row_meta   = st.session_state.get("row_meta", {})
+            hall_index = st.session_state.get("email_loc_halltickets", {})
 
-            total_sends = sum(
-                len(parts)
-                for em, locs in prepared.items()
-                for loc, parts in locs
-            )
+            # prepared: {(email_key, loc): [(zip_name, zip_bytes), ...]}
+            total_sends = sum(len(parts) for parts in prepared.values())
 
             if total_sends == 0:
                 st.warning("No prepared ZIPs to send.")
@@ -992,96 +992,96 @@ smtp_pass = "your-google-app-password"
                         s.ehlo(); s.starttls(); s.ehlo()
                         s.login(smtp_user, smtp_pass)
 
-                        for send_key, locs in prepared.items():
-                            ht_key, email_key        = send_key
-                            recipient_list_orig      = [e.strip() for e in email_key.split(',') if e.strip()]
-                            meta                     = row_meta.get(send_key, {})
+                        for (email_key, loc), parts in prepared.items():
+                            recipient_list_orig = [e.strip() for e in email_key.split(',') if e.strip()]
+                            meta       = row_meta.get(email_key, {})
                             disp_name  = meta.get("name", "") or "—"
-                            disp_halls = ht_key or "—"
+                            # Show all halltickets that belong to this email+location group
+                            halls_list = hall_index.get((email_key, loc), [])
+                            disp_halls = ", ".join(halls_list) if halls_list else "—"
 
-                            for loc, parts in locs:
-                                total_parts = len(parts)
-                                for part_idx, (zipname, zipbytes) in enumerate(parts, start=1):
-                                    sent_count += 1
+                            total_parts = len(parts)
+                            for part_idx, (zipname, zipbytes) in enumerate(parts, start=1):
+                                sent_count += 1
 
-                                    final_recipients = ([test_email] if test_mode and test_email
-                                                        else recipient_list_orig)
+                                final_recipients = ([test_email] if test_mode and test_email
+                                                    else recipient_list_orig)
 
-                                    if not final_recipients:
-                                        err_msg = "Recipient email address is empty"
-                                        failed_log.append({
-                                            "recipients": email_key, "loc": loc,
-                                            "zip": zipname, "error": err_msg
-                                        })
-                                        live_rows.append({
-                                            "#": sent_count, "Name": disp_name,
-                                            "Hallticket": disp_halls,
-                                            "Email": email_key, "Location": loc,
-                                            "ZIP": zipname, "Status": "Failed", "Error": err_msg
-                                        })
-                                        log_send(email_key, disp_name, disp_halls,
-                                                 loc, zipname, "Failed", err_msg)
-                                        continue
-
-                                    msg = EmailMessage()
-                                    msg["From"]    = smtp_user
-                                    msg["To"]      = ", ".join(final_recipients)
-                                    msg["Subject"] = subj_template.format(
-                                        location=loc, part=part_idx, total_parts=total_parts
-                                    )
-                                    msg.set_content(body_template.format(
-                                        location=loc, part=part_idx, total_parts=total_parts
-                                    ))
-                                    if zipbytes:
-                                        msg.add_attachment(zipbytes, maintype="application",
-                                                           subtype="zip", filename=zipname)
-
-                                    counter_txt.markdown(
-                                        f"**Sending: {sent_count} / {total_sends}** &nbsp;|&nbsp; "
-                                        f"Sent: {len(success_log)} &nbsp;|&nbsp; "
-                                        f"Failed: {len(failed_log)}"
-                                    )
-                                    status_txt.text(
-                                        f"Sending to {final_recipients[0]}  |  {loc}  Part {part_idx}/{total_parts}"
-                                    )
-
-                                    try:
-                                        s.send_message(msg)
-                                        success_log.append({
-                                            "timestamp":  datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                            "recipients": msg["To"],
-                                            "subject":    msg["Subject"],
-                                            "zip_name":   zipname,
-                                            "status":     "Success"
-                                        })
-                                        row_status = "Sent"
-                                        log_send(", ".join(final_recipients), disp_name, disp_halls,
-                                                 loc, zipname, "Sent")
-                                        time.sleep(send_delay)
-                                    except Exception as e:
-                                        logger.error("Failed to send to %s: %s", final_recipients, e)
-                                        failed_log.append({
-                                            "recipients": msg["To"], "loc": loc,
-                                            "zip": zipname, "error": str(e)
-                                        })
-                                        row_status = "Failed"
-                                        log_send(", ".join(final_recipients), disp_name, disp_halls,
-                                                 loc, zipname, "Failed", str(e))
-
+                                if not final_recipients:
+                                    err_msg = "Recipient email address is empty"
+                                    failed_log.append({
+                                        "recipients": email_key, "loc": loc,
+                                        "zip": zipname, "error": err_msg
+                                    })
                                     live_rows.append({
                                         "#": sent_count, "Name": disp_name,
-                                        "Hallticket": disp_halls,
-                                        "Email": ", ".join(final_recipients),
-                                        "Location": loc, "ZIP": zipname,
-                                        "Status": row_status, "Error": ""
+                                        "Halltickets": disp_halls,
+                                        "Email": email_key, "Location": loc,
+                                        "ZIP": zipname, "Status": "Failed", "Error": err_msg
                                     })
+                                    log_send(email_key, disp_name, disp_halls,
+                                             loc, zipname, "Failed", err_msg)
+                                    continue
 
-                                    live_table_hdr.markdown("#### Live Send Log")
-                                    live_table.dataframe(
-                                        pd.DataFrame(live_rows[-200:]),
-                                        width="stretch"
-                                    )
-                                    prog_bar.progress(min(1.0, sent_count / total_sends))
+                                msg = EmailMessage()
+                                msg["From"]    = smtp_user
+                                msg["To"]      = ", ".join(final_recipients)
+                                msg["Subject"] = subj_template.format(
+                                    location=loc, part=part_idx, total_parts=total_parts
+                                )
+                                msg.set_content(body_template.format(
+                                    location=loc, part=part_idx, total_parts=total_parts
+                                ))
+                                if zipbytes:
+                                    msg.add_attachment(zipbytes, maintype="application",
+                                                       subtype="zip", filename=zipname)
+
+                                counter_txt.markdown(
+                                    f"**Sending: {sent_count} / {total_sends}** &nbsp;|&nbsp; "
+                                    f"Sent: {len(success_log)} &nbsp;|&nbsp; "
+                                    f"Failed: {len(failed_log)}"
+                                )
+                                status_txt.text(
+                                    f"Sending to {final_recipients[0]}  |  {loc}  Part {part_idx}/{total_parts}"
+                                )
+
+                                try:
+                                    s.send_message(msg)
+                                    success_log.append({
+                                        "timestamp":  datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                        "recipients": msg["To"],
+                                        "subject":    msg["Subject"],
+                                        "zip_name":   zipname,
+                                        "status":     "Success"
+                                    })
+                                    row_status = "Sent"
+                                    log_send(", ".join(final_recipients), disp_name, disp_halls,
+                                             loc, zipname, "Sent")
+                                    time.sleep(send_delay)
+                                except Exception as e:
+                                    logger.error("Failed to send to %s: %s", final_recipients, e)
+                                    failed_log.append({
+                                        "recipients": msg["To"], "loc": loc,
+                                        "zip": zipname, "error": str(e)
+                                    })
+                                    row_status = "Failed"
+                                    log_send(", ".join(final_recipients), disp_name, disp_halls,
+                                             loc, zipname, "Failed", str(e))
+
+                                live_rows.append({
+                                    "#": sent_count, "Name": disp_name,
+                                    "Halltickets": disp_halls,
+                                    "Email": ", ".join(final_recipients),
+                                    "Location": loc, "ZIP": zipname,
+                                    "Status": row_status, "Error": ""
+                                })
+
+                                live_table_hdr.markdown("#### Live Send Log")
+                                live_table.dataframe(
+                                    pd.DataFrame(live_rows[-200:]),
+                                    width="stretch"
+                                )
+                                prog_bar.progress(min(1.0, sent_count / total_sends))
 
                 except Exception as e:
                     st.error(f"A critical error occurred with the SMTP connection: {e}")
