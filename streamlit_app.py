@@ -1,12 +1,15 @@
 # streamlit_app.py
 """
 Aiclex — Result Showing (final combined)
+v2: SQLite PDF cache + live send UI + persistent send logs
 """
 
 import os
 import io
 import re
 import time
+import sqlite3
+import hashlib
 import zipfile
 import logging
 import smtplib
@@ -28,11 +31,14 @@ except Exception:
     PDF2IMAGE = False
 
 # ---------------- Config / Branding ----------------
-APP_TITLE = "CRUX — Result Showing"
-BRAND = "Aiclex Technologies"
-DEFAULT_OCR_DPI = 200
-DEFAULT_OCR_LANG = "eng"
-DEFAULT_ATTACHMENT_MB = 3.0
+APP_TITLE   = "CRUX — Result Showing"
+BRAND       = "Aiclex Technologies"
+DEFAULT_OCR_DPI         = 200
+DEFAULT_OCR_LANG        = "eng"
+DEFAULT_ATTACHMENT_MB   = 3.0
+
+# SQLite DB path — stored next to the script so it persists across runs
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aiclex_cache.db")
 
 # logging
 logger = logging.getLogger("aiclex")
@@ -42,29 +48,173 @@ if not logger.handlers:
     logger.addHandler(ch)
 logger.setLevel(logging.INFO)
 
-# ---------------- Streamlit UI setup ----------------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.markdown(f"<h1 style='color:#0b74de'>{APP_TITLE}</h1><div style='color:gray'>Built by {BRAND}</div>", unsafe_allow_html=True)
-st.write("---")
-st.info("Steps: 1) Upload Excel & ZIP, 2) Process & Preview, 3) Prepare ZIPs, 4) Send (Test Mode available).")
+# ---------------- SQLite helpers ----------------
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+def init_db():
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pdf_cache (
+                pdf_hash    TEXT PRIMARY KEY,
+                pdf_name    TEXT,
+                hallticket  TEXT,
+                marks       TEXT,
+                status      TEXT,
+                processed_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS send_log (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp        TEXT,
+                recipient_email  TEXT,
+                name             TEXT,
+                hallticket       TEXT,
+                location         TEXT,
+                zip_name         TEXT,
+                status           TEXT,
+                error            TEXT
+            )
+        """)
+        conn.commit()
+
+def pdf_hash(pdf_bytes: bytes) -> str:
+    return hashlib.md5(pdf_bytes).hexdigest()
+
+def cache_get(h: str):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT pdf_name, hallticket, marks, status FROM pdf_cache WHERE pdf_hash=?", (h,)
+        ).fetchone()
+    if row:
+        return {
+            "pdf_name":    row[0],
+            "hallticket":  row[1],
+            "marks":       int(row[2]) if (row[2] and row[2].lstrip("-").isdigit()) else row[2],
+            "status":      row[3],
+            "pdf_bytes":   None,
+            "text_snippet": "",
+            "_from_cache": True
+        }
+    return None
+
+def cache_put(h: str, result: dict):
+    marks_val = str(result.get("marks", "")) if result.get("marks") is not None else ""
+    with get_db() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO pdf_cache
+               (pdf_hash, pdf_name, hallticket, marks, status, processed_at)
+               VALUES (?,?,?,?,?,?)""",
+            (h, result.get("pdf_name",""), result.get("hallticket",""),
+             marks_val, result.get("status",""), datetime.now().isoformat())
+        )
+        conn.commit()
+
+def log_send(recipient_email, name, hallticket, location, zip_name, status, error=""):
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO send_log
+               (timestamp, recipient_email, name, hallticket, location, zip_name, status, error)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+             recipient_email, name, hallticket, location, zip_name, status, error)
+        )
+        conn.commit()
+
+def load_send_logs() -> pd.DataFrame:
+    with get_db() as conn:
+        df = pd.read_sql_query("SELECT * FROM send_log ORDER BY id DESC LIMIT 5000", conn)
+    return df
+
+def cache_stats():
+    with get_db() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM pdf_cache").fetchone()[0]
+    return total
+
+# Init DB on startup
+init_db()
 
 # ---------------- Patterns ----------------
-LABEL_RE = re.compile(r"Marks\s*Obtained", re.IGNORECASE)
+LABEL_RE     = re.compile(r"Marks\s*Obtained", re.IGNORECASE)
 MARKS_NUM_RE = re.compile(r"\b([0-9]{1,3})\b")
-ABSENT_RE = re.compile(r"\b(absent|not present)\b", re.IGNORECASE)
-PASSFAIL_RE = re.compile(r"([0-9]{1,3})\s*(PASS|FAIL)", re.IGNORECASE)
-HALL_RE = re.compile(r"\b[0-9]{3,}\b")
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+ABSENT_RE    = re.compile(r"\b(absent|not present)\b", re.IGNORECASE)
+PASSFAIL_RE  = re.compile(r"([0-9]{1,3})\s*(PASS|FAIL)", re.IGNORECASE)
+HALL_RE      = re.compile(r"\b[0-9]{3,}\b")
+EMAIL_RE     = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+# ---------------- Streamlit UI setup ----------------
+st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon=None)
+
+st.markdown(
+    f"""
+    <div style='padding:1.2rem 1.5rem; background:linear-gradient(90deg,#0b74de 0%,#0550a0 100%);
+                border-radius:10px; margin-bottom:0.5rem;'>
+        <h1 style='color:#ffffff; margin:0; font-size:2rem; letter-spacing:0.5px;'>{APP_TITLE}</h1>
+        <p style='color:#cce0ff; margin:0.25rem 0 0; font-size:0.85rem;'>Built by {BRAND}</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    """
+    <div style='display:flex; gap:0.6rem; margin:0.8rem 0 1rem;'>
+        <div style='flex:1; background:#f0f6ff; border-left:4px solid #0b74de;
+                    padding:0.5rem 0.75rem; border-radius:4px; font-size:0.82rem; color:#333;'>
+            <b>Step 1</b><br>Upload Excel &amp; ZIP
+        </div>
+        <div style='flex:1; background:#f0f6ff; border-left:4px solid #0b74de;
+                    padding:0.5rem 0.75rem; border-radius:4px; font-size:0.82rem; color:#333;'>
+            <b>Step 2</b><br>Process &amp; Preview
+        </div>
+        <div style='flex:1; background:#f0f6ff; border-left:4px solid #0b74de;
+                    padding:0.5rem 0.75rem; border-radius:4px; font-size:0.82rem; color:#333;'>
+            <b>Step 3</b><br>Prepare ZIPs
+        </div>
+        <div style='flex:1; background:#f0f6ff; border-left:4px solid #0b74de;
+                    padding:0.5rem 0.75rem; border-radius:4px; font-size:0.82rem; color:#333;'>
+            <b>Step 4</b><br>Send Emails
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+cached_count = cache_stats()
+st.markdown(
+    f"<div style='background:#eaf4fb; border:1px solid #b3d9f0; border-radius:6px; "
+    f"padding:0.4rem 0.8rem; font-size:0.82rem; color:#1a5276; margin-bottom:0.5rem;'>"
+    f"SQLite Cache &nbsp;|&nbsp; <b>{cached_count}</b> PDFs already cached — OCR will be skipped for these."
+    f"</div>",
+    unsafe_allow_html=True
+)
 
 # ---------------- Sidebar config ----------------
-st.sidebar.header("OCR & Email Settings")
-tesseract_path = st.sidebar.text_input("Tesseract path (optional)", value=os.environ.get("TESSERACT_CMD",""))
-ocr_lang = st.sidebar.text_input("OCR language (e.g. eng or eng+hin)", value=DEFAULT_OCR_LANG)
-ocr_dpi = st.sidebar.number_input("OCR DPI (pdf2image)", value=int(DEFAULT_OCR_DPI), min_value=100, max_value=400, step=10)
+st.sidebar.markdown(
+    "<div style='font-size:1rem; font-weight:700; color:#0b74de; "
+    "padding-bottom:0.3rem; border-bottom:2px solid #0b74de; margin-bottom:0.6rem;'>"
+    "Settings</div>",
+    unsafe_allow_html=True
+)
+st.sidebar.markdown("**OCR Configuration**")
+tesseract_path      = st.sidebar.text_input("Tesseract path (optional)", value=os.environ.get("TESSERACT_CMD",""))
+ocr_lang            = st.sidebar.text_input("OCR language (e.g. eng or eng+hin)", value=DEFAULT_OCR_LANG)
+ocr_dpi             = st.sidebar.number_input("OCR DPI (pdf2image)", value=int(DEFAULT_OCR_DPI), min_value=100, max_value=400, step=10)
+st.sidebar.markdown("**Email Configuration**")
 attachment_limit_mb = st.sidebar.number_input("Attachment limit (MB)", value=float(DEFAULT_ATTACHMENT_MB), step=0.5)
-send_delay = st.sidebar.number_input("Delay between sends (s)", value=1.0, step=0.5)
-show_ocr_debug = st.sidebar.checkbox("Show OCR debug snippet", value=False)
-st.sidebar.markdown("Install system packages if needed: poppler-utils, tesseract-ocr")
+send_delay          = st.sidebar.number_input("Delay between sends (s)", value=1.0, step=0.5)
+show_ocr_debug      = st.sidebar.checkbox("Show OCR debug snippet", value=False)
+st.sidebar.caption("System packages required: poppler-utils, tesseract-ocr")
+st.sidebar.markdown("---")
+if st.sidebar.button("Clear PDF Cache"):
+    with get_db() as conn:
+        conn.execute("DELETE FROM pdf_cache")
+        conn.commit()
+    st.sidebar.success("PDF cache cleared successfully.")
 
 if tesseract_path:
     pytesseract.pytesseract.tesseract_cmd = tesseract_path
@@ -82,37 +232,35 @@ def human_bytes(n):
     return f"{n:.2f} TB"
 
 class ProcessTracker:
-    """Single progress bar with ETA for multi-stage processing"""
     def __init__(self, total_steps, description="Processing", show_ui=True):
-        self.total_steps = total_steps
+        self.total_steps  = max(1, total_steps)
         self.current_step = 0
-        self.description = description
-        self.start_time = time.time()
-        self.show_ui = show_ui
-        # Create persistent streamlit elements only if show_ui is True
+        self.description  = description
+        self.start_time   = time.time()
+        self.show_ui      = show_ui
         if show_ui:
             self.progress_bar = st.progress(0)
-            self.status = st.empty()
+            self.status       = st.empty()
         else:
             self.progress_bar = None
-            self.status = None
-        
+            self.status       = None
+
     def update(self, step_desc):
         self.current_step += 1
-        # Calculate progress and ETA
-        progress = min(1.0, self.current_step / self.total_steps)  # Ensure progress doesn't exceed 1.0
-        elapsed = time.time() - self.start_time
-        if self.current_step > 1:  # Need at least 2 steps for ETA
-            eta = (elapsed / self.current_step) * (self.total_steps - self.current_step)
+        progress = min(1.0, self.current_step / self.total_steps)
+        elapsed  = time.time() - self.start_time
+        if self.current_step > 1:
+            eta      = (elapsed / self.current_step) * (self.total_steps - self.current_step)
             eta_text = f"ETA: {int(eta)}s"
         else:
             eta_text = "Calculating ETA..."
-        
-        # Update UI only if show_ui is True
         if self.show_ui:
             self.progress_bar.progress(progress)
-            self.status.write(f"{self.description}: {step_desc} ({min(self.current_step, self.total_steps)}/{self.total_steps}) - {eta_text}")
-    
+            self.status.write(
+                f"{self.description}: {step_desc} "
+                f"({min(self.current_step, self.total_steps)}/{self.total_steps}) - {eta_text}"
+            )
+
     def done(self, message="Processing complete!"):
         if self.show_ui:
             self.progress_bar.progress(1.0)
@@ -125,9 +273,8 @@ def is_pdf_bytes(b: bytes) -> bool:
     except Exception:
         return False
 
-# OCR / text extraction
+# OCR / text extraction — LOGIC UNCHANGED
 def extract_text_from_pdf_bytes(pdf_bytes: bytes, dpi: int = DEFAULT_OCR_DPI, lang: str = DEFAULT_OCR_LANG) -> str:
-    # 1) pdfplumber text
     texts = []
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -144,10 +291,9 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, dpi: int = DEFAULT_OCR_DPI, la
     if combined:
         return combined
 
-    # 2) pdf2image -> pytesseract
     if PDF2IMAGE:
         try:
-            pages = convert_from_bytes(pdf_bytes, dpi=dpi)
+            pages     = convert_from_bytes(pdf_bytes, dpi=dpi)
             ocr_texts = []
             for im in pages:
                 try:
@@ -160,7 +306,6 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, dpi: int = DEFAULT_OCR_DPI, la
         except Exception:
             pass
 
-    # 3) pdfplumber page.to_image -> pytesseract
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             ocr_texts = []
@@ -179,7 +324,6 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, dpi: int = DEFAULT_OCR_DPI, la
     except Exception:
         pass
 
-    # 4) PIL fallback
     try:
         im = Image.open(io.BytesIO(pdf_bytes))
         try:
@@ -189,72 +333,113 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, dpi: int = DEFAULT_OCR_DPI, la
     except Exception:
         return ""
 
-# parse PDF according to given rules
-def parse_pdf_bytes(pdf_bytes: bytes, fname: str = "", ocr_dpi: int = DEFAULT_OCR_DPI, ocr_lang_s: str = DEFAULT_OCR_LANG):
-    text = extract_text_from_pdf_bytes(pdf_bytes, dpi=ocr_dpi, lang=ocr_lang_s) or ""
+
+def _extract_hallticket_from_filename(fname: str) -> str:
+    """
+    Extract hallticket from filename like admit-card-1036-29-803038629.pdf
+    Takes the LAST long numeric group (>=6 digits) from the stem.
+    Falls back to last any-length digit group.
+    """
+    stem       = os.path.splitext(os.path.basename(fname))[0]
+    all_groups = re.findall(r"\d+", stem)
+    if not all_groups:
+        return ""
+    long_groups = [g for g in all_groups if len(g) >= 6]
+    if long_groups:
+        return long_groups[-1]
+    return all_groups[-1]
+
+
+# parse PDF — cache-aware, stronger filename hallticket fallback
+def parse_pdf_bytes(pdf_bytes: bytes, fname: str = "",
+                    ocr_dpi: int = DEFAULT_OCR_DPI,
+                    ocr_lang_s: str = DEFAULT_OCR_LANG):
+    h      = pdf_hash(pdf_bytes)
+    cached = cache_get(h)
+    if cached is not None:
+        cached["pdf_bytes"] = pdf_bytes
+        cached["pdf_name"]  = os.path.basename(fname) or cached["pdf_name"]
+        return cached
+
+    # Cache miss: full OCR
+    text      = extract_text_from_pdf_bytes(pdf_bytes, dpi=ocr_dpi, lang=ocr_lang_s) or ""
     text_norm = text.replace('\xa0', ' ')
-    # hallticket candidate
-    h_cands = HALL_RE.findall(text_norm)
-    if h_cands:
-        hall = max(h_cands, key=len)
+
+    # Hallticket: OCR candidates
+    h_cands  = HALL_RE.findall(text_norm)
+    hall_ocr = max(h_cands, key=len) if h_cands else ""
+
+    # Filename candidate
+    hall_fname = _extract_hallticket_from_filename(fname)
+
+    # Prefer filename when it is longer (more specific) OR when OCR gives nothing
+    if hall_fname and (not hall_ocr or len(hall_fname) >= len(hall_ocr)):
+        hall = hall_fname
+    elif hall_ocr:
+        hall = hall_ocr
     else:
-        fn_digits = re.findall(r"\d+", os.path.basename(fname))
-        hall = fn_digits[-1] if fn_digits else ""
-    # compute marks/status
-    marks = None
+        hall = ""
+
+    # Marks / status — LOGIC UNCHANGED
+    marks  = None
     status = "Absent"
     if ABSENT_RE.search(text_norm):
-        marks = ""
+        marks  = ""
         status = "Absent"
     else:
         pf = PASSFAIL_RE.search(text_norm)
         if pf:
             try:
-                val = int(pf.group(1))
-                marks = val
+                val    = int(pf.group(1))
+                marks  = val
                 status = "Pass" if val > 49 else "Fail"
             except:
-                marks = ""
+                marks  = ""
                 status = "Absent"
         else:
             lbl = LABEL_RE.search(text_norm)
             if lbl:
                 snippet = text_norm[lbl.end():lbl.end()+200]
-                mnum = re.search(r"([0-9]{1,3})", snippet)
+                mnum    = re.search(r"([0-9]{1,3})", snippet)
                 if mnum:
-                    val = int(mnum.group(1))
-                    marks = val
+                    val    = int(mnum.group(1))
+                    marks  = val
                     status = "Pass" if val > 49 else "Fail"
                 else:
-                    marks = ""
+                    marks  = ""
                     status = "Absent"
             else:
                 nums = MARKS_NUM_RE.findall(text_norm)
                 nums = [int(n) for n in nums if 0 <= int(n) <= 100]
                 if nums:
-                    val = nums[-1]
-                    marks = val
+                    val    = nums[-1]
+                    marks  = val
                     status = "Pass" if val > 49 else "Fail"
                 else:
-                    marks = ""
+                    marks  = ""
                     status = "Absent"
-    return {
-        "pdf_name": os.path.basename(fname),
-        "pdf_bytes": pdf_bytes,
-        "hallticket": str(hall).strip(),
-        "marks": marks,
-        "status": status,
-        "text_snippet": (text_norm[:2000] if show_ocr_debug else "")
-    }
 
-# Robust recursive ZIP extraction
-def extract_from_zip_recursive(zip_bytes: bytes, ocr_dpi: int, ocr_lang_s: str, progress: ProcessTracker = None, nested_call: bool = False):
+    result = {
+        "pdf_name":      os.path.basename(fname),
+        "pdf_bytes":     pdf_bytes,
+        "hallticket":    str(hall).strip(),
+        "marks":         marks,
+        "status":        status,
+        "text_snippet":  (text_norm[:2000] if show_ocr_debug else ""),
+        "_from_cache":   False
+    }
+    cache_put(h, result)
+    return result
+
+
+# Recursive ZIP extraction — LOGIC UNCHANGED
+def extract_from_zip_recursive(zip_bytes: bytes, ocr_dpi: int, ocr_lang_s: str,
+                                progress: ProcessTracker = None, nested_call: bool = False):
     results = []
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             names = zf.namelist()
             total = len(names)
-            # Only create new tracker for top-level call, with UI disabled for nested progress
             if progress is None and not nested_call:
                 progress = ProcessTracker(total, "Processing ZIP files", show_ui=False)
             for i, name in enumerate(names, start=1):
@@ -289,19 +474,15 @@ def extract_from_zip_recursive(zip_bytes: bytes, ocr_dpi: int, ocr_lang_s: str, 
                             results.append(parse_pdf_bytes(data, fname=name, ocr_dpi=ocr_dpi, ocr_lang_s=ocr_lang_s))
                         except Exception as e:
                             logger.warning("Failed parse raw-PDF %s: %s", name, e)
-                    else:
-                        # ignore other files
-                        pass
             if progress and not nested_call:
                 progress.done("ZIP processing complete!")
     except zipfile.BadZipFile:
-        # top-level not a zip -> caller will handle
         raise
     return results
 
-# Fill excel logic
+
+# Fill excel — LOGIC UNCHANGED
 def fill_excel_using_pdf_data(df: pd.DataFrame, pdf_data: list, hall_col: str):
-    # build pdf map prefer numeric
     pdf_map = {}
     for p in pdf_data:
         k = str(p.get("hallticket","")).strip()
@@ -314,19 +495,18 @@ def fill_excel_using_pdf_data(df: pd.DataFrame, pdf_data: list, hall_col: str):
             if (not isinstance(existing.get("marks"), int)) and isinstance(p.get("marks"), int):
                 pdf_map[k] = p
 
-    marks_col = "marks"
+    marks_col  = "marks"
     status_col = "status"
     if marks_col not in df.columns:
         df[marks_col] = ""
     if status_col not in df.columns:
         df[status_col] = ""
 
-    filled = 0
+    filled    = 0
     unmatched = []
-    total = len(df)
-    
-    # Single progress tracker for Excel filling (without UI)
-    progress = ProcessTracker(total, "Filling Excel data", show_ui=False)
+    total     = len(df)
+    progress  = ProcessTracker(total, "Filling Excel data", show_ui=False)
+
     for i, (idx, row) in enumerate(df.iterrows(), start=1):
         progress.update(f"Processing row {i}")
         ht = str(row.get(hall_col,"")).strip()
@@ -347,24 +527,24 @@ def fill_excel_using_pdf_data(df: pd.DataFrame, pdf_data: list, hall_col: str):
                         val = pdf_map[k]
                         break
         if val is None:
-            # No matching PDF found for this hallticket
-            df.at[idx, marks_col] = ""
+            df.at[idx, marks_col]  = ""
             df.at[idx, status_col] = "No PDF"
         else:
             m = val.get("marks")
-            if isinstance(m,int):
-                df.at[idx, marks_col] = str(int(m))
+            if isinstance(m, int):
+                df.at[idx, marks_col]  = str(int(m))
                 df.at[idx, status_col] = "Pass" if int(m) > 49 else "Fail"
             else:
-                # PDF exists but marks couldn't be parsed to an integer
-                df.at[idx, marks_col] = ""
+                df.at[idx, marks_col]  = ""
                 df.at[idx, status_col] = "Absent "
         filled += 1
+
     progress.update(f"Processed {i} rows")
     progress.done("Excel filling complete!")
     return df, filled, unmatched, pdf_map
 
-# ZIP helpers
+
+# ZIP helpers — LOGIC UNCHANGED
 def make_zip_bytes(file_entries):
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -373,44 +553,46 @@ def make_zip_bytes(file_entries):
     bio.seek(0)
     return bio.read()
 
-# MODIFICATION: Replaced the zip splitting function with a clearer, more robust version.
 def split_files_into_zip_parts(file_entries, max_bytes, zip_name_prefix="results"):
     if not file_entries:
         return []
-
-    parts = []
+    parts         = []
     current_files = []
-    part_no = 1
-    
+    part_no       = 1
     for fname, content in file_entries:
-        # Check if adding the new file would make the current part too big
         if current_files and len(make_zip_bytes(current_files + [(fname, content)])) > max_bytes:
-            # If it's too big, finalize (flush) the current part
             zip_name = f"{zip_name_prefix}_part{part_no}.zip"
             parts.append((zip_name, make_zip_bytes(current_files)))
             part_no += 1
-            current_files = [] # Start a new empty part
-        
-        # Add the file to the current part.
+            current_files = []
         current_files.append((fname, content))
-        
-        # It's possible for a single file to be larger than the max_bytes limit.
-        # If so, this part (containing just this one file) must be flushed immediately.
         if len(make_zip_bytes(current_files)) > max_bytes:
             zip_name = f"{zip_name_prefix}_part{part_no}.zip"
             parts.append((zip_name, make_zip_bytes(current_files)))
             part_no += 1
             current_files = []
-            
-    # After the loop finishes, there might be files left in the last part. Flush them.
     if current_files:
         zip_name = f"{zip_name_prefix}_part{part_no}.zip"
         parts.append((zip_name, make_zip_bytes(current_files)))
-        
     return parts
 
-# ---------------- Main UI Flow ----------------
-st.header("Step 1 — Upload Excel/CSV and ZIP")
+
+def detect_name_col(df: pd.DataFrame) -> str:
+    for c in df.columns:
+        if re.fullmatch(r"name|student[\s_]?name|candidate[\s_]?name|full[\s_]?name", c.strip(), re.IGNORECASE):
+            return c
+    return ""
+
+
+# ================================================================
+# Main UI
+# ================================================================
+st.markdown(
+    "<div style='margin-top:1rem; padding:0.5rem 1rem; background:#0b74de; color:#fff; "
+    "border-radius:6px; font-size:1rem; font-weight:600;'>Step 1 — Upload Files</div>",
+    unsafe_allow_html=True
+)
+st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
 col1, col2 = st.columns(2)
 with col1:
     uploaded_excel = st.file_uploader("Upload Excel or CSV", type=["xlsx","csv"])
@@ -418,14 +600,13 @@ with col2:
     uploaded_zip = st.file_uploader("Upload ZIP (nested zips with PDFs)", type=["zip"])
 
 if uploaded_excel and uploaded_zip:
-    # read excel
     try:
         if 'df' not in st.session_state or st.session_state.get('uploaded_excel_name') != uploaded_excel.name:
             if uploaded_excel.name.lower().endswith(".csv"):
                 df = pd.read_csv(uploaded_excel, dtype=str).fillna("")
             else:
                 df = pd.read_excel(uploaded_excel, dtype=str, engine="openpyxl").fillna("")
-            st.session_state['df'] = df
+            st.session_state['df']                  = df
             st.session_state['uploaded_excel_name'] = uploaded_excel.name
         df = st.session_state['df']
     except Exception as e:
@@ -433,32 +614,45 @@ if uploaded_excel and uploaded_zip:
         st.stop()
 
     st.success(f"Excel loaded — {len(df)} rows")
-    cols = df.columns.tolist()
-    hall_col = st.selectbox("Select Hallticket column", cols)
-    email_col = st.selectbox("Select Email column", cols)
+    cols         = df.columns.tolist()
+    hall_col     = st.selectbox("Select Hallticket column", cols)
+    email_col    = st.selectbox("Select Email column", cols)
     location_col = st.selectbox("Select Location column", cols)
 
-    # Use an explicit processing button so OCR/filling doesn't run immediately on upload.
-    process_key = f"{uploaded_excel.name}|{uploaded_zip.name}"
-    start_process = st.button("Start processing (Run OCR & Fill results)")
+    auto_name        = detect_name_col(df)
+    name_col_options = ["(None)"] + cols
+    default_name_idx = name_col_options.index(auto_name) if auto_name in name_col_options else 0
+    name_col = st.selectbox(
+        "Select Name column (used in live send log)",
+        name_col_options,
+        index=default_name_idx
+    )
+    if name_col == "(None)":
+        name_col = None
 
+    process_key       = f"{uploaded_excel.name}|{uploaded_zip.name}"
+    start_process     = st.button("Start processing (Run OCR & Fill results)")
     already_processed = st.session_state.get("processed_key") == process_key
 
     if start_process and not already_processed:
         try:
             zip_bytes = uploaded_zip.read()
-            # Count total PDFs first
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-                total_files = len([n for n in zf.namelist() if n.lower().endswith('.pdf') or n.lower().endswith('.zip')])
-            
-            # Main progress bar that will be visible in UI
+                total_files = len([n for n in zf.namelist()
+                                   if n.lower().endswith('.pdf') or n.lower().endswith('.zip')])
             main_progress = ProcessTracker(total_files, "Processing files", show_ui=True)
-            pdf_data = extract_from_zip_recursive(zip_bytes, ocr_dpi=ocr_dpi, ocr_lang_s=ocr_lang, progress=main_progress)
+            pdf_data      = extract_from_zip_recursive(zip_bytes, ocr_dpi=ocr_dpi,
+                                                        ocr_lang_s=ocr_lang, progress=main_progress)
             main_progress.done("Processing complete!")
-            
-            st.session_state['pdf_data'] = pdf_data
+            st.session_state['pdf_data']          = pdf_data
             st.session_state['uploaded_zip_name'] = uploaded_zip.name
-            st.session_state['processed_key'] = process_key
+            st.session_state['processed_key']     = process_key
+            st.markdown(
+                f"<div style='background:#eaf4fb; border:1px solid #b3d9f0; border-radius:6px; "
+                f"padding:0.4rem 0.8rem; font-size:0.82rem; color:#1a5276;'>"
+                f"SQLite Cache updated — <b>{cache_stats()}</b> PDFs now cached.</div>",
+                unsafe_allow_html=True
+            )
         except zipfile.BadZipFile:
             st.error("Uploaded file is not a valid ZIP archive.")
             st.session_state['pdf_data'] = []
@@ -467,18 +661,39 @@ if uploaded_excel and uploaded_zip:
             st.session_state['pdf_data'] = []
 
     if st.session_state.get('processed_key') == process_key:
-        # use processed results from session state
-        pdf_data = st.session_state.get('pdf_data', [])
-        st.info(f"PDF records extracted: {len(pdf_data)}")
+        pdf_data    = st.session_state.get('pdf_data', [])
+        cache_hits  = sum(1 for p in pdf_data if p.get("_from_cache"))
+        ocr_fresh   = len(pdf_data) - cache_hits
+        st.markdown(
+            f"<div style='display:flex; gap:0.6rem; margin:0.5rem 0;'>"
+            f"<div style='flex:1; background:#f8f9fa; border:1px solid #dee2e6; border-radius:6px; "
+            f"padding:0.6rem 1rem; text-align:center;'>"
+            f"<div style='font-size:1.4rem; font-weight:700; color:#0b74de;'>{len(pdf_data)}</div>"
+            f"<div style='font-size:0.75rem; color:#555;'>Total PDFs</div></div>"
+            f"<div style='flex:1; background:#f8f9fa; border:1px solid #dee2e6; border-radius:6px; "
+            f"padding:0.6rem 1rem; text-align:center;'>"
+            f"<div style='font-size:1.4rem; font-weight:700; color:#1a7a4a;'>{cache_hits}</div>"
+            f"<div style='font-size:0.75rem; color:#555;'>From Cache</div></div>"
+            f"<div style='flex:1; background:#f8f9fa; border:1px solid #dee2e6; border-radius:6px; "
+            f"padding:0.6rem 1rem; text-align:center;'>"
+            f"<div style='font-size:1.4rem; font-weight:700; color:#8B5E00;'>{ocr_fresh}</div>"
+            f"<div style='font-size:0.75rem; color:#555;'>OCR Processed</div></div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
         if show_ocr_debug and pdf_data:
             st.subheader("OCR debug (sample snippets)")
-            debug_rows = [{"pdf_name": p["pdf_name"], "hallticket": p["hallticket"], "marks": p["marks"], "status": p["status"], "text_snippet": p.get("text_snippet","")[:500]} for p in pdf_data]
+            debug_rows = [{"pdf_name": p["pdf_name"], "hallticket": p["hallticket"],
+                           "marks": p["marks"], "status": p["status"],
+                           "text_snippet": p.get("text_snippet","")[:500]} for p in pdf_data]
             st.dataframe(pd.DataFrame(debug_rows).head(200))
 
-        updated_df, filled_count, unmatched, pdf_map = fill_excel_using_pdf_data(df.copy(), pdf_data, hall_col)
+        updated_df, filled_count, unmatched, pdf_map = fill_excel_using_pdf_data(
+            df.copy(), pdf_data, hall_col
+        )
         st.session_state['updated_df'] = updated_df
-        st.session_state['pdf_map'] = pdf_map
+        st.session_state['pdf_map']    = pdf_map
         st.success(f"Filled {filled_count} rows (marks/status).")
         if unmatched:
             st.warning(f"{len(unmatched)} rows had missing hallticket.")
@@ -488,29 +703,33 @@ if uploaded_excel and uploaded_zip:
     else:
         st.info("Files uploaded. Click 'Start processing (Run OCR & Fill results)' to begin OCR and fill the Excel.")
 
-    # Ensure variables exist even if user hasn't processed yet to avoid NameError.
     updated_df = st.session_state.get('updated_df', df).copy()
-    pdf_data = st.session_state.get('pdf_data', [])
+    pdf_data   = st.session_state.get('pdf_data', [])
 
-    # Ensure expected columns exist to avoid KeyError later when summarizing
     if 'marks' not in updated_df.columns:
         updated_df['marks'] = ""
     if 'status' not in updated_df.columns:
-        # default to 'Absent' for rows with no marks or leave empty string
         updated_df['status'] = ""
 
-    sheets = {}
-    total = len(updated_df)
-    pass_count = int((updated_df['status'] == 'Pass').sum())
-    fail_count = int((updated_df['status'] == 'Fail').sum())
+    sheets       = {}
+    total        = len(updated_df)
+    pass_count   = int((updated_df['status'] == 'Pass').sum())
+    fail_count   = int((updated_df['status'] == 'Fail').sum())
     absent_count = int((updated_df['status'] == 'Absent').sum())
-    summary_overall = pd.DataFrame([{"Total": total, "Pass": pass_count, "Fail": fail_count, "Absent": absent_count}])
-    sheets["results"] = updated_df
+    summary_overall = pd.DataFrame([{
+        "Total": total, "Pass": pass_count, "Fail": fail_count, "Absent": absent_count
+    }])
+    sheets["results"]         = updated_df
     sheets["summary_overall"] = summary_overall
     if location_col in updated_df.columns:
         by_loc = []
         for loc, g in updated_df.groupby(location_col):
-            by_loc.append({"Location": loc, "Total": len(g), "Pass": int((g['status']=="Pass").sum()), "Fail": int((g['status']=="Fail").sum()), "Absent": int((g['status']=="Absent").sum())})
+            by_loc.append({
+                "Location": loc, "Total": len(g),
+                "Pass":   int((g['status']=="Pass").sum()),
+                "Fail":   int((g['status']=="Fail").sum()),
+                "Absent": int((g['status']=="Absent").sum())
+            })
         sheets["summary_by_location"] = pd.DataFrame(by_loc)
 
     out_buf = io.BytesIO()
@@ -518,35 +737,54 @@ if uploaded_excel and uploaded_zip:
         for sheet_name, sheet_df in sheets.items():
             sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
     out_buf.seek(0)
-    st.download_button("Download results + summary (Excel)", data=out_buf, file_name=f"aiclex_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(
+        "Download results + summary (Excel)",
+        data=out_buf,
+        file_name=f"aiclex_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
-    st.markdown("---")
-    st.header("Step 2 — Prepare ZIPs grouped by recipient & location")
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='padding:0.5rem 1rem; background:#0b74de; color:#fff; "
+        "border-radius:6px; font-size:1rem; font-weight:600;'>Step 2 — Prepare ZIPs</div>",
+        unsafe_allow_html=True
+    )
+    st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+
     pdf_map_multi = defaultdict(list)
     for p in pdf_data:
         k = str(p.get("hallticket","")).strip()
         if k:
             pdf_map_multi[k].append(p)
 
-    recipients = defaultdict(lambda: defaultdict(list))
+    recipients  = defaultdict(lambda: defaultdict(list))
     missing_log = []
+    row_meta    = {}   # email_key -> [{name, hallticket}]
+
     for idx, row in updated_df.iterrows():
-        ht = str(row.get(hall_col,"")).strip()
+        ht         = str(row.get(hall_col,"")).strip()
         emails_raw = str(row.get(email_col,"")).strip()
-        loc = str(row.get(location_col,"")).strip() or "Unknown"
-        
+        loc        = str(row.get(location_col,"")).strip() or "Unknown"
+        name_val   = str(row.get(name_col,"")).strip() if name_col else ""
+
         if not emails_raw:
             continue
-        
-        emails_list = [e.strip() for e in re.split(r"[;, \n]+", emails_raw) if e.strip()]
+        emails_list   = [e.strip() for e in re.split(r"[;, \n]+", emails_raw) if e.strip()]
         if not emails_list:
             continue
         recipient_key = ", ".join(sorted(list(set(emails_list))))
 
+        if recipient_key not in row_meta:
+            row_meta[recipient_key] = []
+        row_meta[recipient_key].append({"name": name_val, "hallticket": ht})
+
         found_any = False
         if ht and ht in pdf_map_multi:
             for p in pdf_map_multi[ht]:
-                recipients[recipient_key][loc].append((f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"]))
+                recipients[recipient_key][loc].append(
+                    (f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"])
+                )
             found_any = True
         else:
             digits = re.sub(r"\D","", ht)
@@ -555,14 +793,20 @@ if uploaded_excel and uploaded_zip:
                     kd = re.sub(r"\D","", str(k))
                     if kd and (kd == digits or kd.endswith(digits) or digits.endswith(kd)):
                         for p in lst:
-                            recipients[recipient_key][loc].append((f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"]))
+                            recipients[recipient_key][loc].append(
+                                (f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"])
+                            )
                         found_any = True
                         break
-        
         if not found_any:
             missing_log.append({"index": idx, "hallticket": ht, "emails": recipient_key, "location": loc})
 
-    st.info(f"Recipients prepared: {len(recipients)} (sample below)")
+    st.markdown(
+        f"<div style='background:#f0f6ff; border:1px solid #b3d0f0; border-radius:6px; "
+        f"padding:0.45rem 0.9rem; font-size:0.85rem; color:#1a3a6b; margin-bottom:0.4rem;'>"
+        f"Recipients prepared: <b>{len(recipients)}</b> — preview below</div>",
+        unsafe_allow_html=True
+    )
     rec_preview = []
     for em, locs in list(recipients.items())[:200]:
         files_count = sum(len(lst) for lst in locs.values())
@@ -575,47 +819,64 @@ if uploaded_excel and uploaded_zip:
 
     if st.button("Prepare ZIPs (grouped by recipient->location)"):
         st.info("Preparing ZIP parts in memory (may use RAM).")
-        max_bytes = int(attachment_limit_mb * 1024 * 1024)
-        prepared = {}
+        max_bytes        = int(attachment_limit_mb * 1024 * 1024)
+        prepared         = {}
         total_recipients = len(recipients)
-        prog_place = st.empty()
-        prog = st.progress(0)
-        # Single progress tracker for ZIP preparation
-        progress = ProcessTracker(total_recipients, "Preparing ZIP files")
+        progress         = ProcessTracker(total_recipients, "Preparing ZIP files")
         for i, (em, locs) in enumerate(recipients.items(), start=1):
             progress.update(f"Preparing files for: {em}")
             prepared[em] = []
             for loc, files in locs.items():
                 safe_prefix = re.sub(r"[^A-Za-z0-9]+","_", loc)[:40] or "loc"
-                parts = split_files_into_zip_parts(files, max_bytes, zip_name_prefix=safe_prefix)
+                parts       = split_files_into_zip_parts(files, max_bytes, zip_name_prefix=safe_prefix)
                 prepared[em].append((loc, parts))
         progress.done("ZIP preparation complete!")
         st.session_state["prepared"] = prepared
+        st.session_state["row_meta"] = row_meta
         st.success("Prepared ZIP parts stored in session memory.")
 
-# ---------------- Preview & Send ----------------
+
+# ================================================================
+# Preview & Send
+# ================================================================
 if "prepared" in st.session_state:
-    st.header("Step 3 — ZIP Preview (by recipient & location)")
-    preview_rows = []
+    st.markdown(
+        "<div style='padding:0.5rem 1rem; background:#0b74de; color:#fff; "
+        "border-radius:6px; font-size:1rem; font-weight:600;'>Step 3 — ZIP Preview</div>",
+        unsafe_allow_html=True
+    )
+    st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+    preview_rows     = []
     location_summary = defaultdict(list)
     for em, locs in st.session_state["prepared"].items():
         for loc, parts in locs:
             for pname, pbytes in parts:
-                preview_rows.append({"email": em, "location": loc, "zip_name": pname, "size": human_bytes(len(pbytes))})
+                sz = len(pbytes) if pbytes else 0
+                preview_rows.append({
+                    "email": em, "location": loc,
+                    "zip_name": pname, "size": human_bytes(sz)
+                })
                 location_summary[loc].append(pname)
     if preview_rows:
         st.dataframe(pd.DataFrame(preview_rows).head(500))
     loc_summary_rows = []
     for loc, partnames in location_summary.items():
-        loc_summary_rows.append({"Location": loc, "PartsCount": len(partnames), "Parts": ", ".join(partnames)})
+        loc_summary_rows.append({
+            "Location": loc, "PartsCount": len(partnames),
+            "Parts": ", ".join(partnames)
+        })
     if loc_summary_rows:
         st.subheader("Location-wise parts summary")
         st.dataframe(pd.DataFrame(loc_summary_rows))
 
-    st.markdown("---")
-    st.header("Step 4 — Send Emails")
-    
-    # Load credentials from Streamlit secrets to keep them secure
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='padding:0.5rem 1rem; background:#0b74de; color:#fff; "
+        "border-radius:6px; font-size:1rem; font-weight:600;'>Step 4 — Send Emails</div>",
+        unsafe_allow_html=True
+    )
+    st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+
     smtp_user = None
     smtp_pass = None
     try:
@@ -631,89 +892,187 @@ smtp_user = "your-email@gmail.com"
 smtp_pass = "your-google-app-password"
 """)
 
-    test_mode = st.checkbox("Test mode (send all to test email)", value=True)
-    test_email = st.text_input("Test email (if test mode ON)")
-    subj_template = st.text_input("Subject template", value="Results for {location} (Part {part}/{total_parts})")
-    body_template = st.text_area("Body template", value="Hello,\n\nPlease find attached results for {location} (Part {part}/{total_parts}).\n\nRegards,\nAiclex")
+    test_mode     = st.checkbox("Test mode (send all to test email)", value=True)
+    test_email    = st.text_input("Test email (if test mode ON)")
+    subj_template = st.text_input("Subject template",
+                                   value="Results for {location} (Part {part}/{total_parts})")
+    body_template = st.text_area("Body template",
+                                  value="Hello,\n\nPlease find attached results for {location} (Part {part}/{total_parts}).\n\nRegards,\nAiclex")
 
     if st.button("Start sending prepared ZIPs"):
         if not smtp_user or not smtp_pass:
             st.error("Cannot send emails. Please configure your email credentials in the `.streamlit/secrets.toml` file first.")
         else:
-            total_sends = 0
-            for em, locs in st.session_state["prepared"].items():
-                for loc, parts in locs:
-                    total_sends += len(parts)
+            prepared = st.session_state["prepared"]
+            row_meta = st.session_state.get("row_meta", {})
+
+            total_sends = sum(
+                len(parts)
+                for em, locs in prepared.items()
+                for loc, parts in locs
+            )
 
             if total_sends == 0:
-                st.warning("No prepared zips to send.")
+                st.warning("No prepared ZIPs to send.")
             else:
-                progress = st.progress(0)
-                status = st.empty()
+                # ---- Live UI ----
+                st.markdown(
+                    f"<div style='background:#0b74de; color:#fff; border-radius:6px; "
+                    f"padding:0.6rem 1.2rem; font-size:1rem; font-weight:600; margin-bottom:0.5rem;'>"
+                    f"Total emails to send: {total_sends}</div>",
+                    unsafe_allow_html=True
+                )
+                prog_bar       = st.progress(0)
+                status_txt     = st.empty()
+                counter_txt    = st.empty()
+                live_table_hdr = st.empty()
+                live_table     = st.empty()
+
                 success_log = []
-                failed_log = []
-                sent_count = 0
-                
+                failed_log  = []
+                sent_count  = 0
+                live_rows   = []
+
                 try:
                     with smtplib.SMTP("smtp.gmail.com", 587, timeout=60) as s:
-                        s.ehlo()
-                        s.starttls()
-                        s.ehlo()
+                        s.ehlo(); s.starttls(); s.ehlo()
                         s.login(smtp_user, smtp_pass)
-                        
-                        items = list(st.session_state["prepared"].items())
-                        for ri, (email_key, locs) in enumerate(items, start=1):
+
+                        for email_key, locs in prepared.items():
                             recipient_list_orig = [e.strip() for e in email_key.split(',') if e.strip()]
-                            
+                            meta_list           = row_meta.get(email_key, [])
+                            disp_name  = ", ".join(sorted({m["name"] for m in meta_list if m["name"]})) or "—"
+                            disp_halls = ", ".join(sorted({m["hallticket"] for m in meta_list if m["hallticket"]})) or "—"
+
                             for loc, parts in locs:
                                 total_parts = len(parts)
                                 for part_idx, (zipname, zipbytes) in enumerate(parts, start=1):
                                     sent_count += 1
-                                    
-                                    final_recipients = [test_email] if test_mode and test_email else recipient_list_orig
-                                    
+
+                                    final_recipients = ([test_email] if test_mode and test_email
+                                                        else recipient_list_orig)
+
                                     if not final_recipients:
-                                        failed_log.append({"recipients": email_key, "loc": loc, "zip": zipname, "error": "Recipient email address is empty"})
+                                        err_msg = "Recipient email address is empty"
+                                        failed_log.append({
+                                            "recipients": email_key, "loc": loc,
+                                            "zip": zipname, "error": err_msg
+                                        })
+                                        live_rows.append({
+                                            "#": sent_count, "Name": disp_name,
+                                            "Hallticket": disp_halls,
+                                            "Email": email_key, "Location": loc,
+                                            "ZIP": zipname, "Status": "Failed", "Error": err_msg
+                                        })
+                                        log_send(email_key, disp_name, disp_halls,
+                                                 loc, zipname, "Failed", err_msg)
                                         continue
 
                                     msg = EmailMessage()
-                                    msg["From"] = smtp_user
-                                    msg["To"] = ", ".join(final_recipients)
-                                    msg["Subject"] = subj_template.format(location=loc, part=part_idx, total_parts=total_parts)
-                                    msg.set_content(body_template.format(location=loc, part=part_idx, total_parts=total_parts))
-                                    msg.add_attachment(zipbytes, maintype="application", subtype="zip", filename=zipname)
-                                    
-                                    status_text = f"Sending {sent_count}/{total_sends} to {final_recipients[0]}... ({loc} Part {part_idx}/{total_parts})"
-                                    status.text(status_text)
-                                    
+                                    msg["From"]    = smtp_user
+                                    msg["To"]      = ", ".join(final_recipients)
+                                    msg["Subject"] = subj_template.format(
+                                        location=loc, part=part_idx, total_parts=total_parts
+                                    )
+                                    msg.set_content(body_template.format(
+                                        location=loc, part=part_idx, total_parts=total_parts
+                                    ))
+                                    if zipbytes:
+                                        msg.add_attachment(zipbytes, maintype="application",
+                                                           subtype="zip", filename=zipname)
+
+                                    counter_txt.markdown(
+                                        f"**Sending: {sent_count} / {total_sends}** &nbsp;|&nbsp; "
+                                        f"Sent: {len(success_log)} &nbsp;|&nbsp; "
+                                        f"Failed: {len(failed_log)}"
+                                    )
+                                    status_txt.text(
+                                        f"Sending to {final_recipients[0]}  |  {loc}  Part {part_idx}/{total_parts}"
+                                    )
+
                                     try:
                                         s.send_message(msg)
                                         success_log.append({
-                                            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                            "timestamp":  datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                             "recipients": msg["To"],
-                                            "subject": msg["Subject"],
-                                            "zip_name": zipname,
-                                            "status": "Success"
+                                            "subject":    msg["Subject"],
+                                            "zip_name":   zipname,
+                                            "status":     "Success"
                                         })
+                                        row_status = "Sent"
+                                        log_send(", ".join(final_recipients), disp_name, disp_halls,
+                                                 loc, zipname, "Sent")
                                         time.sleep(send_delay)
                                     except Exception as e:
-                                        logger.error(f"Failed to send to {final_recipients}: {e}")
-                                        failed_log.append({"recipients": msg["To"], "loc": loc, "zip": zipname, "error": str(e)})
-                                    
-                                    progress.progress(min(1.0, sent_count / total_sends))
-                
+                                        logger.error("Failed to send to %s: %s", final_recipients, e)
+                                        failed_log.append({
+                                            "recipients": msg["To"], "loc": loc,
+                                            "zip": zipname, "error": str(e)
+                                        })
+                                        row_status = "Failed"
+                                        log_send(", ".join(final_recipients), disp_name, disp_halls,
+                                                 loc, zipname, "Failed", str(e))
+
+                                    live_rows.append({
+                                        "#": sent_count, "Name": disp_name,
+                                        "Hallticket": disp_halls,
+                                        "Email": ", ".join(final_recipients),
+                                        "Location": loc, "ZIP": zipname,
+                                        "Status": row_status, "Error": ""
+                                    })
+
+                                    live_table_hdr.markdown("#### Live Send Log")
+                                    live_table.dataframe(
+                                        pd.DataFrame(live_rows[-200:]),
+                                        use_container_width=True
+                                    )
+                                    prog_bar.progress(min(1.0, sent_count / total_sends))
+
                 except Exception as e:
                     st.error(f"A critical error occurred with the SMTP connection: {e}")
 
-                status.empty()
-                st.success(f"Sending finished. Successful: {len(success_log)}. Failed: {len(failed_log)}")
-                
+                status_txt.empty()
+                counter_txt.empty()
+                st.markdown(
+                    f"<div style='background:#1a7a4a; color:#fff; border-radius:6px; "
+                    f"padding:0.6rem 1.2rem; font-size:0.95rem; font-weight:600; margin:0.5rem 0;'>"
+                    f"Sending complete — Successful: {len(success_log)} &nbsp;|&nbsp; "
+                    f"Failed: {len(failed_log)} &nbsp; (Total: {total_sends})</div>",
+                    unsafe_allow_html=True
+                )
                 if success_log:
-                    st.subheader("✅ Success Log")
+                    st.subheader("Success Log")
                     st.dataframe(pd.DataFrame(success_log))
                 if failed_log:
-                    st.subheader("❌ Failure Log")
+                    st.subheader("Failure Log")
                     st.dataframe(pd.DataFrame(failed_log))
 
-st.write("---")
-st.markdown(f"<div style='color:gray; font-size:12px'>App by {BRAND} — Aiclex</div>", unsafe_allow_html=True)
+    # ---- Persistent logs ----
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='padding:0.4rem 1rem; background:#f0f4f8; border:1px solid #cbd5e0; "
+        "border-radius:6px; font-size:0.9rem; font-weight:600; color:#2d3748;'>"
+        "Send History — All-time Log (SQLite)</div>",
+        unsafe_allow_html=True
+    )
+    st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
+    all_logs = load_send_logs()
+    if not all_logs.empty:
+        st.dataframe(all_logs, use_container_width=True)
+        log_csv = all_logs.to_csv(index=False).encode()
+        st.download_button(
+            "Download all send logs (CSV)",
+            data=log_csv,
+            file_name=f"send_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("No send logs found yet. Logs will appear here after sending emails.")
+
+st.markdown(
+    f"<div style='margin-top:2rem; padding:0.6rem 1.2rem; background:#f0f4f8; "
+    f"border-top:1px solid #cbd5e0; border-radius:6px; color:#555; font-size:0.78rem;'>"
+    f"Built by {BRAND} &nbsp;|&nbsp; CRUX Result Sending System"
+    f"</div>",
+    unsafe_allow_html=True
+)
