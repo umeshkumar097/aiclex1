@@ -356,13 +356,18 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, dpi: int = DEFAULT_OCR_DPI, la
 def _extract_hallticket_from_filename(fname: str) -> str:
     """
     Extract hallticket from filename like admit-card-1036-29-803038629.pdf
-    Takes the LAST long numeric group (>=6 digits) from the stem.
-    Falls back to last any-length digit group.
+    Rule: take the LAST 9-digit numeric group from the stem.
+    Only falls back to other lengths if no 9-digit group exists.
     """
-    stem       = os.path.splitext(os.path.basename(fname))[0]
+    stem = os.path.splitext(os.path.basename(fname))[0]
     all_groups = re.findall(r"\d+", stem)
     if not all_groups:
         return ""
+    # Prefer exactly 9-digit groups (standard hallticket length)
+    nine_digit = [g for g in all_groups if len(g) == 9]
+    if nine_digit:
+        return nine_digit[-1]
+    # Fallback: last group with >=6 digits
     long_groups = [g for g in all_groups if len(g) >= 6]
     if long_groups:
         return long_groups[-1]
@@ -533,16 +538,20 @@ def fill_excel_using_pdf_data(df: pd.DataFrame, pdf_data: list, hall_col: str):
             unmatched.append({"index": idx, "reason": "no_hallticket"})
             continue
         val = None
+        # 1) Exact match
         if ht in pdf_map:
             val = pdf_map[ht]
         else:
-            digits = re.sub(r"\D","", ht)
+            # 2) Strip non-digits from Excel hallticket and try exact match
+            digits = re.sub(r"\D", "", ht)
             if digits and digits in pdf_map:
                 val = pdf_map[digits]
             else:
+                # 3) Try matching PDF key's digits exactly against Excel digits
+                #    Both must be equal length AND identical — no suffix/prefix tricks
                 for k in pdf_map.keys():
-                    kd = re.sub(r"\D","", str(k))
-                    if kd and (k.endswith(digits) or digits.endswith(kd) or kd.endswith(digits)):
+                    kd = re.sub(r"\D", "", str(k))
+                    if kd and digits and kd == digits:
                         val = pdf_map[k]
                         break
         if val is None:
@@ -806,11 +815,12 @@ if uploaded_excel and uploaded_zip:
                 )
             found_any = True
         else:
-            digits = re.sub(r"\D","", ht)
+            # Strict exact match: strip non-digits from both sides, must be identical
+            digits = re.sub(r"\D", "", ht)
             if digits:
                 for k, lst in pdf_map_multi.items():
-                    kd = re.sub(r"\D","", str(k))
-                    if kd and (kd == digits or kd.endswith(digits) or digits.endswith(kd)):
+                    kd = re.sub(r"\D", "", str(k))
+                    if kd and kd == digits:
                         for p in lst:
                             recipients[recipient_key][loc].append(
                                 (f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"])
