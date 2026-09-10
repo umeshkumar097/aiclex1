@@ -876,7 +876,9 @@ if uploaded_excel and uploaded_zip:
             progress.update(f"Preparing: {ht_key} → {em_key[:40]}")
             prepared[send_key] = []
             for loc, files in locs.items():
-                safe_prefix = re.sub(r"[^A-Za-z0-9]+","_", loc)[:40] or "loc"
+                safe_loc    = re.sub(r"[^A-Za-z0-9]+", "_", loc)[:30] or "loc"
+                safe_ht     = re.sub(r"[^A-Za-z0-9]+", "_", ht_key)[:20] or "ht"
+                safe_prefix = f"{safe_loc}_{safe_ht}"   # e.g. Pune_803038629
                 parts       = split_files_into_zip_parts(files, max_bytes, zip_name_prefix=safe_prefix)
                 prepared[send_key].append((loc, parts))
         progress.done("ZIP preparation complete!")
