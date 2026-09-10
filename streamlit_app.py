@@ -788,7 +788,8 @@ if uploaded_excel and uploaded_zip:
 
     recipients  = defaultdict(lambda: defaultdict(list))
     missing_log = []
-    row_meta    = {}   # email_key -> [{name, hallticket}]
+    # send_key = (hallticket, email_key) — unique per row so PDFs never cross to wrong person
+    row_meta    = {}
 
     for idx, row in updated_df.iterrows():
         ht         = str(row.get(hall_col,"")).strip()
@@ -803,14 +804,16 @@ if uploaded_excel and uploaded_zip:
             continue
         recipient_key = ", ".join(sorted(list(set(emails_list))))
 
-        if recipient_key not in row_meta:
-            row_meta[recipient_key] = []
-        row_meta[recipient_key].append({"name": name_val, "hallticket": ht})
+        # Unique key = (hallticket + email group) — prevents cross-sending
+        send_key = (ht, recipient_key)
+
+        if send_key not in row_meta:
+            row_meta[send_key] = {"name": name_val, "hallticket": ht, "email_key": recipient_key}
 
         found_any = False
         if ht and ht in pdf_map_multi:
             for p in pdf_map_multi[ht]:
-                recipients[recipient_key][loc].append(
+                recipients[send_key][loc].append(
                     (f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"])
                 )
             found_any = True
@@ -822,7 +825,7 @@ if uploaded_excel and uploaded_zip:
                     kd = re.sub(r"\D", "", str(k))
                     if kd and kd == digits:
                         for p in lst:
-                            recipients[recipient_key][loc].append(
+                            recipients[send_key][loc].append(
                                 (f"{p.get('hallticket') or 'noid'}_{p.get('pdf_name')}", p["pdf_bytes"])
                             )
                         found_any = True
@@ -833,13 +836,18 @@ if uploaded_excel and uploaded_zip:
     st.markdown(
         f"<div style='background:#f0f6ff; border:1px solid #b3d0f0; border-radius:6px; "
         f"padding:0.45rem 0.9rem; font-size:0.85rem; color:#1a3a6b; margin-bottom:0.4rem;'>"
-        f"Recipients prepared: <b>{len(recipients)}</b> — preview below</div>",
+        f"Recipients prepared: <b>{len(recipients)}</b> — each hallticket isolated to its own email group</div>",
         unsafe_allow_html=True
     )
     rec_preview = []
-    for em, locs in list(recipients.items())[:200]:
+    for (ht_key, em_key), locs in list(recipients.items())[:200]:
         files_count = sum(len(lst) for lst in locs.values())
-        rec_preview.append({"email": em, "locations": ", ".join(locs.keys()), "files": files_count})
+        rec_preview.append({
+            "hallticket": ht_key,
+            "email": em_key,
+            "locations": ", ".join(locs.keys()),
+            "files": files_count
+        })
     if rec_preview:
         st.dataframe(pd.DataFrame(rec_preview))
     if missing_log:
@@ -852,13 +860,14 @@ if uploaded_excel and uploaded_zip:
         prepared         = {}
         total_recipients = len(recipients)
         progress         = ProcessTracker(total_recipients, "Preparing ZIP files")
-        for i, (em, locs) in enumerate(recipients.items(), start=1):
-            progress.update(f"Preparing files for: {em}")
-            prepared[em] = []
+        for i, (send_key, locs) in enumerate(recipients.items(), start=1):
+            ht_key, em_key = send_key
+            progress.update(f"Preparing: {ht_key} → {em_key[:40]}")
+            prepared[send_key] = []
             for loc, files in locs.items():
                 safe_prefix = re.sub(r"[^A-Za-z0-9]+","_", loc)[:40] or "loc"
                 parts       = split_files_into_zip_parts(files, max_bytes, zip_name_prefix=safe_prefix)
-                prepared[em].append((loc, parts))
+                prepared[send_key].append((loc, parts))
         progress.done("ZIP preparation complete!")
         st.session_state["prepared"] = prepared
         st.session_state["row_meta"] = row_meta
@@ -877,13 +886,16 @@ if "prepared" in st.session_state:
     st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
     preview_rows     = []
     location_summary = defaultdict(list)
-    for em, locs in st.session_state["prepared"].items():
+    for (ht_key, em_key), locs in st.session_state["prepared"].items():
         for loc, parts in locs:
             for pname, pbytes in parts:
                 sz = len(pbytes) if pbytes else 0
                 preview_rows.append({
-                    "email": em, "location": loc,
-                    "zip_name": pname, "size": human_bytes(sz)
+                    "hallticket": ht_key,
+                    "email": em_key,
+                    "location": loc,
+                    "zip_name": pname,
+                    "size": human_bytes(sz)
                 })
                 location_summary[loc].append(pname)
     if preview_rows:
@@ -967,11 +979,12 @@ smtp_pass = "your-google-app-password"
                         s.ehlo(); s.starttls(); s.ehlo()
                         s.login(smtp_user, smtp_pass)
 
-                        for email_key, locs in prepared.items():
-                            recipient_list_orig = [e.strip() for e in email_key.split(',') if e.strip()]
-                            meta_list           = row_meta.get(email_key, [])
-                            disp_name  = ", ".join(sorted({m["name"] for m in meta_list if m["name"]})) or "—"
-                            disp_halls = ", ".join(sorted({m["hallticket"] for m in meta_list if m["hallticket"]})) or "—"
+                        for send_key, locs in prepared.items():
+                            ht_key, email_key        = send_key
+                            recipient_list_orig      = [e.strip() for e in email_key.split(',') if e.strip()]
+                            meta                     = row_meta.get(send_key, {})
+                            disp_name  = meta.get("name", "") or "—"
+                            disp_halls = ht_key or "—"
 
                             for loc, parts in locs:
                                 total_parts = len(parts)
