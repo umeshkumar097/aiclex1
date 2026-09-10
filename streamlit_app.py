@@ -50,13 +50,15 @@ logger.setLevel(logging.INFO)
 
 # ---------------- SQLite helpers ----------------
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    """Open a new SQLite connection with WAL mode and a generous timeout."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 def init_db():
-    with get_db() as conn:
+    conn = get_db()
+    try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS pdf_cache (
                 pdf_hash    TEXT PRIMARY KEY,
@@ -81,30 +83,36 @@ def init_db():
             )
         """)
         conn.commit()
+    finally:
+        conn.close()
 
 def pdf_hash(pdf_bytes: bytes) -> str:
     return hashlib.md5(pdf_bytes).hexdigest()
 
 def cache_get(h: str):
-    with get_db() as conn:
+    conn = get_db()
+    try:
         row = conn.execute(
             "SELECT pdf_name, hallticket, marks, status FROM pdf_cache WHERE pdf_hash=?", (h,)
         ).fetchone()
+    finally:
+        conn.close()
     if row:
         return {
-            "pdf_name":    row[0],
-            "hallticket":  row[1],
-            "marks":       int(row[2]) if (row[2] and row[2].lstrip("-").isdigit()) else row[2],
-            "status":      row[3],
-            "pdf_bytes":   None,
+            "pdf_name":     row[0],
+            "hallticket":   row[1],
+            "marks":        int(row[2]) if (row[2] and row[2].lstrip("-").isdigit()) else row[2],
+            "status":       row[3],
+            "pdf_bytes":    None,
             "text_snippet": "",
-            "_from_cache": True
+            "_from_cache":  True
         }
     return None
 
 def cache_put(h: str, result: dict):
     marks_val = str(result.get("marks", "")) if result.get("marks") is not None else ""
-    with get_db() as conn:
+    conn = get_db()
+    try:
         conn.execute(
             """INSERT OR REPLACE INTO pdf_cache
                (pdf_hash, pdf_name, hallticket, marks, status, processed_at)
@@ -113,9 +121,12 @@ def cache_put(h: str, result: dict):
              marks_val, result.get("status",""), datetime.now().isoformat())
         )
         conn.commit()
+    finally:
+        conn.close()
 
 def log_send(recipient_email, name, hallticket, location, zip_name, status, error=""):
-    with get_db() as conn:
+    conn = get_db()
+    try:
         conn.execute(
             """INSERT INTO send_log
                (timestamp, recipient_email, name, hallticket, location, zip_name, status, error)
@@ -124,15 +135,23 @@ def log_send(recipient_email, name, hallticket, location, zip_name, status, erro
              recipient_email, name, hallticket, location, zip_name, status, error)
         )
         conn.commit()
+    finally:
+        conn.close()
 
 def load_send_logs() -> pd.DataFrame:
-    with get_db() as conn:
+    conn = get_db()
+    try:
         df = pd.read_sql_query("SELECT * FROM send_log ORDER BY id DESC LIMIT 5000", conn)
+    finally:
+        conn.close()
     return df
 
 def cache_stats():
-    with get_db() as conn:
+    conn = get_db()
+    try:
         total = conn.execute("SELECT COUNT(*) FROM pdf_cache").fetchone()[0]
+    finally:
+        conn.close()
     return total
 
 # Init DB on startup
