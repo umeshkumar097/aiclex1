@@ -634,6 +634,17 @@ if uploaded_excel and uploaded_zip:
                 df = pd.read_csv(uploaded_excel, dtype=str).fillna("")
             else:
                 df = pd.read_excel(uploaded_excel, dtype=str, engine="openpyxl").fillna("")
+            # Deduplicate column names (e.g. 'Hallticket No', 'Hallticket No' → 'Hallticket No', 'Hallticket No_1')
+            seen = {}
+            new_cols = []
+            for col in df.columns:
+                if col in seen:
+                    seen[col] += 1
+                    new_cols.append(f"{col}_{seen[col]}")
+                else:
+                    seen[col] = 0
+                    new_cols.append(col)
+            df.columns = new_cols
             st.session_state['df']                  = df
             st.session_state['uploaded_excel_name'] = uploaded_excel.name
         df = st.session_state['df']
@@ -1066,7 +1077,7 @@ smtp_pass = "your-google-app-password"
                                     live_table_hdr.markdown("#### Live Send Log")
                                     live_table.dataframe(
                                         pd.DataFrame(live_rows[-200:]),
-                                        use_container_width=True
+                                        width="stretch"
                                     )
                                     prog_bar.progress(min(1.0, sent_count / total_sends))
 
@@ -1100,7 +1111,7 @@ smtp_pass = "your-google-app-password"
     st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
     all_logs = load_send_logs()
     if not all_logs.empty:
-        st.dataframe(all_logs, use_container_width=True)
+        st.dataframe(all_logs, width="stretch")
         log_csv = all_logs.to_csv(index=False).encode()
         st.download_button(
             "Download all send logs (CSV)",
